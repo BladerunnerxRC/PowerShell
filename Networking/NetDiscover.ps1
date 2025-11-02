@@ -4,6 +4,8 @@
     HTML highlights anything with "Disabled" anywhere in yellow.
 #>
 
+#Requires -Modules NetTCPIP, NetAdapter
+
 [CmdletBinding()]
 Param(
     [string]$OutFolder = (Join-Path $env:USERPROFILE 'Documents\NIC_Diagnostics'),
@@ -119,79 +121,105 @@ function Write-NICHtmlReport {
 
     $inAdv = $false
     foreach ($l in $ReportLines) {
-    $enc = [System.Net.WebUtility]::HtmlEncode($l)
+        $enc = [System.Net.WebUtility]::HtmlEncode($l)
 
-        if ($enc -eq '===============================') {
-            $html.Add('<span class="dim">' + $enc + '</span>')
-            continue
+        # =====================================================
+        # 4. MAIN LOOP
+        # =====================================================
+
+        # Non-interactive: generate reports for all adapters and return
+        if ($NonInteractive.IsPresent) {
+            $allAdaptersNI = Get-NetAdapter | Sort-Object -Property Name
+            if (-not $allAdaptersNI) {
+                Write-Host "No adapters found." -ForegroundColor Red
+                return
+            }
+            foreach ($adapter in $allAdaptersNI) {
+                try {
+                    [void](New-NICReport -Nic $adapter -OutFolder $OutFolder `
+                        -BOLD $BOLD -UNDERLINE $UNDERLINE -RESET $RESET `
+                        -GREEN $GREEN -YELLOW $YELLOW -LIGHTBLUE $LIGHTBLUE)
+                } catch {
+                    Write-Host ("Failed to generate report for {0}: {1}" -f $adapter.Name, $_.Exception.Message) -ForegroundColor Red
+                }
+            }
+            return
         }
 
-        if ($enc -eq 'Advanced Properties:') {
-            $html.Add('<span class="b">' + $enc + '</span>')
-            $inAdv = $true
-            continue
-        }
+        $script:__quit = $false
+        while (-not $script:__quit) {
+            $allAdapters = Get-NetAdapter | Sort-Object -Property Name
+            if (-not $allAdapters) {
+                Write-Host "No adapters found." -ForegroundColor Red
+                break
+            }
 
-        if ($inAdv -and $enc -eq '------------------------------------') {
-            $html.Add('<span class="dim">' + $enc + '</span>')
-            $inAdv = $false
-            continue
-        }
+            Write-Host ""
+            Write-Host "Available Network Adapters:"
+            $i = 1
+            foreach ($adapter in $allAdapters) {
+                $statusText = "(Status: {0})" -f $adapter.Status
+                Write-Host ("[{0}] {1} - {2} " -f $i, $adapter.Name, $adapter.InterfaceDescription) -NoNewline
+                switch ($adapter.Status) {
+                    'Up'           { Write-Host $statusText -ForegroundColor Green }
+                    'Disconnected' { Write-Host $statusText -ForegroundColor Yellow }
+                    'Not Present'  { Write-Host $statusText -ForegroundColor DarkYellow }
+                    default        { Write-Host $statusText -ForegroundColor Gray }
+                }
+                $i++
+            }
 
-        if ($inAdv) {
-            if ($l -match '^  (.+?):\s*(.*)$') {
-                $nameRaw  = $matches[1]
-                $valueRaw = $matches[2]
-                $nameEnc  = [System.Net.WebUtility]::HtmlEncode($nameRaw)
-                $valueEnc = [System.Net.WebUtility]::HtmlEncode($valueRaw)
-
-                if ([string]::IsNullOrWhiteSpace($valueRaw)) {
-                    $html.Add('  <span class="u">' + $nameEnc + ':</span> <span class="bblue">&lt;null&gt;</span>')
-                }
-                elseif ($valueRaw -match '(?i)disabled') {
-                    $html.Add('  <span class="u">' + $nameEnc + ':</span> <span class="y">' + $valueEnc + '</span>')
-                }
-                elseif ($valueRaw -match '^(?i)off$') {
-                    $html.Add('  <span class="u">' + $nameEnc + ':</span> <span class="y">' + $valueEnc + '</span>')
-                }
-                else {
-                    $html.Add('  <span class="u">' + $nameEnc + ':</span> <span class="g">' + $valueEnc + '</span>')
-                }
+            $sel = Read-Host "Enter adapter number (Q to quit)"
+            if ($sel -match '^[Qq]$') { $script:__quit = $true; break }
+            if ($sel -notmatch '^\d+$') {
+                Write-Host "Invalid selection." -ForegroundColor Red
                 continue
-            } else {
-                $html.Add($enc)
+            }
+
+            $idx = [int]$sel
+            if ($idx -lt 1 -or $idx -gt $allAdapters.Count) {
+                Write-Host "Invalid selection." -ForegroundColor Red
                 continue
             }
-        }
 
-        if ($l -match 'Errors' -and $l -notmatch 'Driver') {
-            if ($l -match '0$') {
-                $html.Add('<span class="g">' + $enc + '</span>')
-            } else {
-                $html.Add('<span class="r">' + $enc + '</span>')
+            $nic = $allAdapters[$idx - 1]
+
+            while (-not $script:__quit) {
+                $files = New-NICReport -Nic $nic -OutFolder $OutFolder `
+                    -BOLD $BOLD -UNDERLINE $UNDERLINE -RESET $RESET `
+                    -GREEN $GREEN -YELLOW $YELLOW -LIGHTBLUE $LIGHTBLUE
+
+                Write-Host ""
+                Write-Host "Reports written to:" -ForegroundColor Cyan
+                Write-Host ("1) CSV : {0}" -f $files.Csv)
+                Write-Host ("2) TXT : {0}" -f $files.Txt)
+                Write-Host ("3) HTML: {0}" -f $files.Html)
+
+                $open = Read-Host "Open? (1=CSV,2=TXT,3=HTML,F=folder,N=none,Q=quit)"
+                switch -Regex ($open) {
+                    '^[1]$' { try { Start-Process "excel.exe" -ArgumentList ("`"{0}`"" -f $files.Csv) } catch { Write-Host "Failed to open CSV in Excel: $($_.Exception.Message)" -ForegroundColor Red } }
+                    '^[2]$' { try { Start-Process "notepad.exe" -ArgumentList ("`"{0}`"" -f $files.Txt) } catch { Write-Host "Failed to open TXT in Notepad: $($_.Exception.Message)" -ForegroundColor Red } }
+                    '^[3]$' { try { Start-Process $files.Html } catch { Write-Host "Failed to open HTML in default browser: $($_.Exception.Message)" -ForegroundColor Red } }
+                    '^[Ff]$' { try { Start-Process "explorer.exe" -ArgumentList ("`"{0}`"" -f $OutFolder) } catch { Write-Host "Failed to open folder in Explorer: $($_.Exception.Message)" -ForegroundColor Red } }
+                    '^[Qq]$' { $script:__quit = $true; break }
+                }
+
+                if ($script:__quit) { break }
+
+                $next = Read-Host "R=run again on this NIC, P=pick another, Q=quit"
+                if ($next -match '^[Rr]$') {
+                    continue
+                } elseif ($next -match '^[Pp]$') {
+                    break
+                } elseif ($next -match '^[Qq]$') {
+                    $script:__quit = $true
+                    break
+                } else {
+                    $script:__quit = $true
+                    break
+                }
             }
-            continue
-        }
-
-        if ($l -match 'Discards') {
-            if ($l -match '0$') {
-                $html.Add('<span class="g">' + $enc + '</span>')
-            } else {
-                $html.Add('<span class="y">' + $enc + '</span>')
-            }
-            continue
-        }
-
-        $html.Add($enc)
-    }
-
-    $html.Add('</pre>')
-    $html.Add('</body>')
-    $html.Add('</html>')
-
-    $html -join "`r`n" | Out-File -FilePath $HtmlPath -Encoding UTF8
-} # end Write-NICHtmlReport
-
+        } # end MAIN LOOP
 # =====================================================
 # 3. New-NICReport
 # =====================================================
@@ -239,13 +267,13 @@ function New-NICReport {
         Description   = $Nic.InterfaceDescription
         Status        = $Nic.Status
         MAC           = $Nic.MacAddress
-    Speed         = ($Nic.LinkSpeed -as [string])
+        Speed         = ($Nic.LinkSpeed -as [string])
         MTU           = $mtu
         IPv4          = $ip4
         IPv6          = $ip6
         JumboSetting  = $jumboSetting
         DriverVersion = $Nic.DriverVersion
-    DriverDate    = ($Nic.DriverInformation -as [string])
+        DriverDate    = ($Nic.DriverInformation -as [string])
         RxPackets     = $rxPackets
         TxPackets     = $txPackets
         RxErrors      = $rxErrors
