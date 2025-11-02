@@ -6,8 +6,14 @@
     jumbo frame setting, and driver details. Outputs to console and CSV.
 #>
 
-# Output file (optional)
-$OutFile = "$env:USERPROFILE\Desktop\NIC_Report.csv"
+# Output folder and file
+$OutFolder = "C:\Users\Thoma\OneDrive\Documents\!_DIAGNOSTICS"
+$OutFile = Join-Path $OutFolder "NIC_Report.csv"
+
+# Ensure output folder exists
+if (-not (Test-Path $OutFolder)) {
+    New-Item -ItemType Directory -Path $OutFolder -Force | Out-Null
+}
 
 # Collect NICs that are up and not virtual/tunnel
 $adapters = Get-NetAdapter | Where-Object { $_.Status -eq "Up" -and $_.HardwareInterface -eq $true }
@@ -39,4 +45,3 @@ $results | Format-Table -AutoSize
 # Export to CSV
 $results | Export-Csv -Path $OutFile -NoTypeInformation -Encoding UTF8
 Write-Host "NIC report saved to $OutFile"
-
