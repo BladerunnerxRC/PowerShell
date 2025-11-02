@@ -99,7 +99,7 @@ Script location: `Networking/NetDiscover.ps1` — for questions or improvements,
 
 ---
 
-Generated from reading the script in the `Networking` folder. If you want, I can also:
+Suggested MoDs:
 
 - Add a small non-interactive wrapper to run the report from CI or a scheduled task.
 - Add a `-OutFolder` parameter to the main loop so the output directory doesn't need to be edited inline.
