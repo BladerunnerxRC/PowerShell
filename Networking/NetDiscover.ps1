@@ -123,103 +123,55 @@ function Write-NICHtmlReport {
     foreach ($l in $ReportLines) {
         $enc = [System.Net.WebUtility]::HtmlEncode($l)
 
-        # =====================================================
-        # 4. MAIN LOOP
-        # =====================================================
-
-        # Non-interactive: generate reports for all adapters and return
-        if ($NonInteractive.IsPresent) {
-            $allAdaptersNI = Get-NetAdapter | Sort-Object -Property Name
-            if (-not $allAdaptersNI) {
-                Write-Host "No adapters found." -ForegroundColor Red
-                return
-            }
-            foreach ($adapter in $allAdaptersNI) {
-                try {
-                    [void](New-NICReport -Nic $adapter -OutFolder $OutFolder `
-                        -BOLD $BOLD -UNDERLINE $UNDERLINE -RESET $RESET `
-                        -GREEN $GREEN -YELLOW $YELLOW -LIGHTBLUE $LIGHTBLUE)
-                } catch {
-                    Write-Host ("Failed to generate report for {0}: {1}" -f $adapter.Name, $_.Exception.Message) -ForegroundColor Red
-                }
-            }
-            return
+        if ($l -eq 'Advanced Properties:') {
+            $html.Add("  <span class=\"b\">$enc</span>")
+            $inAdv = $true
+            continue
         }
 
-        $script:__quit = $false
-        while (-not $script:__quit) {
-            $allAdapters = Get-NetAdapter | Sort-Object -Property Name
-            if (-not $allAdapters) {
-                Write-Host "No adapters found." -ForegroundColor Red
-                break
+        if ($inAdv -and $l -eq '------------------------------------') {
+            $html.Add("  $enc")
+            $inAdv = $false
+            continue
+        }
+
+        if ($inAdv -and $l -match '^  (.+?):\\s*(.*)$') {
+            $name  = [System.Net.WebUtility]::HtmlEncode($matches[1])
+            $value = [System.Net.WebUtility]::HtmlEncode($matches[2])
+
+            if ([string]::IsNullOrWhiteSpace($matches[2])) {
+                $valueHtml = '<span class="bblue">&lt;null&gt;</span>'
+            } elseif ($matches[2] -match '(?i)disabled' -or $matches[2] -match '^(?i)off$') {
+                $valueHtml = "<span class=\"y\">$value</span>"
+            } else {
+                $valueHtml = "<span class=\"g\">$value</span>"
             }
 
-            Write-Host ""
-            Write-Host "Available Network Adapters:"
-            $i = 1
-            foreach ($adapter in $allAdapters) {
-                $statusText = "(Status: {0})" -f $adapter.Status
-                Write-Host ("[{0}] {1} - {2} " -f $i, $adapter.Name, $adapter.InterfaceDescription) -NoNewline
-                switch ($adapter.Status) {
-                    'Up'           { Write-Host $statusText -ForegroundColor Green }
-                    'Disconnected' { Write-Host $statusText -ForegroundColor Yellow }
-                    'Not Present'  { Write-Host $statusText -ForegroundColor DarkYellow }
-                    default        { Write-Host $statusText -ForegroundColor Gray }
-                }
-                $i++
-            }
+            $html.Add(("  <span class=\"u\">{0}</span>: {1}" -f $name, $valueHtml))
+            continue
+        }
 
-            $sel = Read-Host "Enter adapter number (Q to quit)"
-            if ($sel -match '^[Qq]$') { $script:__quit = $true; break }
-            if ($sel -notmatch '^\d+$') {
-                Write-Host "Invalid selection." -ForegroundColor Red
-                continue
-            }
+        if ($l -match 'Errors' -and $l -notmatch 'Driver') {
+            $class = if ($l -match '0$') { 'g' } else { 'r' }
+            $html.Add(("  <span class=\"{0}\">{1}</span>" -f $class, $enc))
+            continue
+        }
 
-            $idx = [int]$sel
-            if ($idx -lt 1 -or $idx -gt $allAdapters.Count) {
-                Write-Host "Invalid selection." -ForegroundColor Red
-                continue
-            }
+        if ($l -match 'Discards') {
+            $class = if ($l -match '0$') { 'g' } else { 'y' }
+            $html.Add(("  <span class=\"{0}\">{1}</span>" -f $class, $enc))
+            continue
+        }
 
-            $nic = $allAdapters[$idx - 1]
+        $html.Add("  $enc")
+    }
 
-            while (-not $script:__quit) {
-                $files = New-NICReport -Nic $nic -OutFolder $OutFolder `
-                    -BOLD $BOLD -UNDERLINE $UNDERLINE -RESET $RESET `
-                    -GREEN $GREEN -YELLOW $YELLOW -LIGHTBLUE $LIGHTBLUE
+    $html.Add('</pre>')
+    $html.Add('</body>')
+    $html.Add('</html>')
 
-                Write-Host ""
-                Write-Host "Reports written to:" -ForegroundColor Cyan
-                Write-Host ("1) CSV : {0}" -f $files.Csv)
-                Write-Host ("2) TXT : {0}" -f $files.Txt)
-                Write-Host ("3) HTML: {0}" -f $files.Html)
+    $html | Out-File -FilePath $HtmlPath -Encoding UTF8
 
-                $open = Read-Host "Open? (1=CSV,2=TXT,3=HTML,F=folder,N=none,Q=quit)"
-                switch -Regex ($open) {
-                    '^[1]$' { try { Start-Process "excel.exe" -ArgumentList ("`"{0}`"" -f $files.Csv) } catch { Write-Host "Failed to open CSV in Excel: $($_.Exception.Message)" -ForegroundColor Red } }
-                    '^[2]$' { try { Start-Process "notepad.exe" -ArgumentList ("`"{0}`"" -f $files.Txt) } catch { Write-Host "Failed to open TXT in Notepad: $($_.Exception.Message)" -ForegroundColor Red } }
-                    '^[3]$' { try { Start-Process $files.Html } catch { Write-Host "Failed to open HTML in default browser: $($_.Exception.Message)" -ForegroundColor Red } }
-                    '^[Ff]$' { try { Start-Process "explorer.exe" -ArgumentList ("`"{0}`"" -f $OutFolder) } catch { Write-Host "Failed to open folder in Explorer: $($_.Exception.Message)" -ForegroundColor Red } }
-                    '^[Qq]$' { $script:__quit = $true; break }
-                }
-
-                if ($script:__quit) { break }
-
-                $next = Read-Host "R=run again on this NIC, P=pick another, Q=quit"
-                if ($next -match '^[Rr]$') {
-                    continue
-                } elseif ($next -match '^[Pp]$') {
-                    break
-                } elseif ($next -match '^[Qq]$') {
-                    $script:__quit = $true
-                    break
-                } else {
-                    $script:__quit = $true
-                    break
-                }
-            }
-        } # end MAIN LOOP
 # =====================================================
 # 3. New-NICReport
 # =====================================================
@@ -403,8 +355,27 @@ function New-NICReport {
 # =====================================================
 # 4. MAIN LOOP
 # =====================================================
-while ($true) {
+if ($NonInteractive.IsPresent) {
+    $allAdaptersNI = Get-NetAdapter | Sort-Object -Property Name
+    if (-not $allAdaptersNI) {
+        Write-Host "No adapters found." -ForegroundColor Red
+        return
+    }
 
+    foreach ($adapter in $allAdaptersNI) {
+        try {
+            [void](New-NICReport -Nic $adapter -OutFolder $OutFolder `
+                -BOLD $BOLD -UNDERLINE $UNDERLINE -RESET $RESET `
+                -GREEN $GREEN -YELLOW $YELLOW -LIGHTBLUE $LIGHTBLUE)
+        } catch {
+            Write-Host ("Failed to generate report for {0}: {1}" -f $adapter.Name, $_.Exception.Message) -ForegroundColor Red
+        }
+    }
+    return
+}
+
+$script:__quit = $false
+while (-not $script:__quit) {
     $allAdapters = Get-NetAdapter | Sort-Object -Property Name
     if (-not $allAdapters) {
         Write-Host "No adapters found." -ForegroundColor Red
@@ -439,29 +410,9 @@ while ($true) {
         continue
     }
 
-    if ($NonInteractive.IsPresent) {
-        $allAdaptersNI = Get-NetAdapter | Sort-Object -Property Name
-        if (-not $allAdaptersNI) {
-            Write-Host "No adapters found." -ForegroundColor Red
-            return
-        }
+    $nic = $allAdapters[$idx - 1]
 
-        foreach ($adapter in $allAdaptersNI) {
-            try {
-                [void](New-NICReport -Nic $adapter -OutFolder $OutFolder `
-                    -BOLD $BOLD -UNDERLINE $UNDERLINE -RESET $RESET `
-                    -GREEN $GREEN -YELLOW $YELLOW -LIGHTBLUE $LIGHTBLUE)
-            } catch {
-                Write-Host ("Failed to generate report for {0}: {1}" -f $adapter.Name, $_.Exception.Message) -ForegroundColor Red
-            }
-        }
-        return
-    }
-
-    $script:__quit = $false
     while (-not $script:__quit) {
-
-    while ($true) {
         $files = New-NICReport -Nic $nic -OutFolder $OutFolder `
             -BOLD $BOLD -UNDERLINE $UNDERLINE -RESET $RESET `
             -GREEN $GREEN -YELLOW $YELLOW -LIGHTBLUE $LIGHTBLUE
@@ -481,8 +432,10 @@ while ($true) {
             '^[Qq]$' { $script:__quit = $true; break }
         }
 
+        if ($script:__quit) { break }
+
         $next = Read-Host "R=run again on this NIC, P=pick another, Q=quit"
-        if ($sel -match '^[Qq]$') { $script:__quit = $true; break }
+        if ($next -match '^[Rr]$') {
             continue
         } elseif ($next -match '^[Pp]$') {
             break
@@ -490,8 +443,10 @@ while ($true) {
             $script:__quit = $true
             break
         } else {
-            $script:__quit = $true
+            Write-Host "Invalid selection. Returning to adapter menu." -ForegroundColor Yellow
             break
         }
     }
-} # end MAIN LOOP
+
+    if ($script:__quit) { break }
+}
