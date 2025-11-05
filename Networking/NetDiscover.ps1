@@ -1,8 +1,10 @@
 <#
 .SYNOPSIS
-  Interactive NIC diagnostic report (TXT/CSV/HTML).
-  - Always adds hidden Advanced properties from Registry for the selected NIC.
-  - HTML uses <pre> (no blank gaps); “Disabled” anywhere → yellow.
+  Interactive NIC diagnostic report (TXT/CSV/HTML + ZIP + JSON).
+  - Includes hidden Advanced properties from Registry for the selected NIC.
+  - Adds: stack/offload/power, driver package details, connectivity checks, routes, ARP,
+          optional RSS mapping, LLDP neighbor, recent NIC events.
+  - HTML uses <pre> (no extra line gaps); "Disabled" in Advanced -> yellow.
 #>
 
 # ==============================
@@ -67,7 +69,7 @@ function Get-NICHiddenAdvancedProperties {
     $nic = Get-NetAdapter -Name $Name -ErrorAction Stop
     $guidB = $nic.InterfaceGuid.ToString("B")
 
-    $devKey = Get-ChildItem $classGuidPath -ErrorAction Stop |
+    $devKey = Get-ChildItem $classGuidPath -ErrorAction SilentlyContinue |
               Where-Object {
                   try { (Get-ItemProperty $_.PsPath -ErrorAction Stop).NetCfgInstanceId -eq $guidB } catch { $false }
               } | Select-Object -First 1
@@ -135,7 +137,141 @@ function Get-NICHiddenAdvancedProperties {
 }
 
 # =====================================================
-# 3) HTML writer — single <pre>, handles both sections
+# 3) Extra diagnostics helpers
+# =====================================================
+function Get-NICStackCaps {
+    param([string]$Name)
+
+    $rsc = Get-NetAdapterRsc -Name $Name -ErrorAction SilentlyContinue
+    $rss = Get-NetAdapterRss -Name $Name -ErrorAction SilentlyContinue
+    $off = Get-NetOffloadGlobalSetting -ErrorAction SilentlyContinue
+    $pwr = Get-NetAdapterPowerManagement -Name $Name -ErrorAction SilentlyContinue
+    $tcp = Get-NetTCPSetting -SettingName InternetCustom -ErrorAction SilentlyContinue
+
+    [PSCustomObject]@{
+        RSCIPv4Enabled   = $rsc.IPv4Enabled
+        RSCIPv6Enabled   = $rsc.IPv6Enabled
+        RSS              = $rss.Enabled
+        Chimney          = $off.Chimney
+        IPsecOffload     = $off.IPsecOffload
+        RscGlobal        = $off.ReceiveSegmentCoalescing
+        ECN              = $tcp.EcnCapability
+        AutoTuning       = $tcp.AutoTuningLevelLocal
+        DCA              = $off.DirectCacheAccess
+        PM_WakeOnMagic   = $pwr.WakeOnMagicPacket
+        PM_WakePattern   = $pwr.WakeOnPattern
+        PM_DeviceSleep   = $pwr.DeviceSleepOnDisconnect
+    }
+}
+
+# FIXED: Escapes DeviceID for WQL and falls back if needed
+function Get-NICDriverDetail {
+    param([string]$PnpDeviceID)
+
+    $escaped = $PnpDeviceID -replace '\\','\\\\' -replace "'","''"
+    try {
+        Get-CimInstance -ClassName Win32_PnPSignedDriver `
+            -Filter "DeviceID='$escaped'" -ErrorAction Stop |
+          Select-Object DeviceName, DriverVersion, DriverDate, DriverProviderName,
+                        DriverName, InfName, IsSigned, Signer, Manufacturer
+    } catch {
+        Get-CimInstance -ClassName Win32_PnPSignedDriver -ErrorAction SilentlyContinue |
+            Where-Object { $_.DeviceID -eq $PnpDeviceID } |
+          Select-Object DeviceName, DriverVersion, DriverDate, DriverProviderName,
+                        DriverName, InfName, IsSigned, Signer, Manufacturer
+    }
+}
+
+function Test-NICBasics {
+    param([int]$IfIndex)
+
+    $gwv4 = (Get-NetRoute -InterfaceIndex $IfIndex -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue |
+             Sort-Object RouteMetric | Select-Object -First 1).NextHop
+    $dns  = (Get-DnsClientServerAddress -InterfaceIndex $IfIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue).ServerAddresses -join ', '
+
+    $gwOk = $null; $dnsOk = $null; $mtuNote = $null
+    if ($gwv4) { $gwOk = Test-Connection -Count 1 -Quiet -Destination $gwv4 }
+    if ($dns)  { $dnsOk = (Resolve-DnsName -Name microsoft.com -ErrorAction SilentlyContinue) -ne $null }
+
+    $mtuOk = $null
+    if ($gwv4) {
+        try {
+            $null = Test-Connection -Destination $gwv4 -Count 1 -BufferSize 1472 -DontFragment -ErrorAction Stop
+            $mtuOk = $true
+        } catch { $mtuOk = $false; $mtuNote = 'DF 1472 failed -> MTU/fragmentation mismatch?' }
+    }
+
+    [PSCustomObject]@{
+        DefaultGateway  = $gwv4
+        GatewayReachable= $gwOk
+        DNSServers      = $dns
+        DNSWorks        = $dnsOk
+        PMTUProbe1472   = $mtuOk
+        PMTUComment     = $mtuNote
+    }
+}
+
+# FIXED: Filter by LogName + StartTime only; then filter ProviderName in pipeline
+function Get-NICRecentEvents {
+    param([string]$Name,[int]$Hours = 1)
+
+    $start = (Get-Date).AddHours(-$Hours)
+    $providers = @('e1iexpress','rt640x64','Ndis','Tcpip')
+
+    Get-WinEvent -FilterHashtable @{ LogName='System'; StartTime=$start } -ErrorAction SilentlyContinue |
+        Where-Object { $_.ProviderName -in $providers } |
+        Select-Object TimeCreated, ProviderName, Id, LevelDisplayName |
+        Sort-Object TimeCreated -Descending |
+        Select-Object -First 50
+}
+
+function Add-NetworkTablesToReport {
+    param([System.Collections.Generic.List[string]]$Report, [int]$IfIndex)
+
+    $Report.Add('Route Table (v4, this IF):')
+    foreach ($r in (Get-NetRoute -InterfaceIndex $IfIndex -AddressFamily IPv4 |
+                    Sort-Object RouteMetric, DestinationPrefix |
+                    Select-Object -First 12)) {
+        $Report.Add( ("  {0,-18} via {1,-15} metric {2}" -f $r.DestinationPrefix, $r.NextHop, $r.RouteMetric) )
+    }
+    $Report.Add('------------------------------------')
+
+    $Report.Add('ARP Table (this IF):')
+    foreach ($n in (Get-NetNeighbor -InterfaceIndex $IfIndex -State Reachable,Stale,Delay,Probe,Permanent -ErrorAction SilentlyContinue |
+                    Sort-Object State | Select-Object -First 15)) {
+        $Report.Add( ("  {0,-15} => {1}  ({2})" -f $n.IPAddress, $n.LinkLayerAddress, $n.State) )
+    }
+    $Report.Add('------------------------------------')
+}
+
+function Get-NICRssMapping {
+    param([string]$Name)
+    try { Get-NetAdapterRss -Name $Name -ErrorAction Stop } catch { $null }
+}
+
+function Try-LLDPNeighbor {
+    try { Get-NetLldpAgent -ErrorAction Stop | Out-Null; Get-NetLldpNeighbor -ErrorAction Stop } catch { $null }
+}
+
+function Save-JsonSnapshot {
+    param([string]$Path,[hashtable]$Data)
+    $Data | ConvertTo-Json -Depth 6 | Out-File -FilePath $Path -Encoding UTF8
+}
+
+function Zip-Run {
+    param([string]$Csv,[string]$Txt,[string]$Html,[string]$Json)
+    $zip = [IO.Path]::ChangeExtension($Html, '.zip')
+    $tmp = Join-Path ([IO.Path]::GetDirectoryName($Html)) ([IO.Path]::GetFileNameWithoutExtension($Html) + "_bundle")
+    if (Test-Path $tmp) { Remove-Item $tmp -Recurse -Force }
+    New-Item -ItemType Directory -Path $tmp | Out-Null
+    Copy-Item $Csv,$Txt,$Html,$Json -Destination $tmp -ErrorAction SilentlyContinue
+    Compress-Archive -Path (Join-Path $tmp '*') -DestinationPath $zip -Force
+    Remove-Item $tmp -Recurse -Force
+    return $zip
+}
+
+# =====================================================
+# 4) HTML writer — single <pre>, with Advanced coloring
 # =====================================================
 function Write-NICHtmlReport {
     param(
@@ -226,7 +362,7 @@ function Write-NICHtmlReport {
 }
 
 # =====================================================
-# 4) New-NICReport (adds hidden section)
+# 5) Build one NIC report
 # =====================================================
 function New-NICReport {
     param(
@@ -286,7 +422,7 @@ function New-NICReport {
         TxDiscards    = $txDiscards
     } | Export-Csv -Path $CsvFile -NoTypeInformation -Encoding UTF8
 
-    # TEXT report
+    # TEXT report build
     $report = New-Object System.Collections.Generic.List[string]
     $report.Add('===============================')
     $report.Add(' NIC Diagnostic Report')
@@ -304,6 +440,8 @@ function New-NICReport {
     $report.Add(("Driver Ver  : {0}" -f $Nic.DriverVersion))
     $report.Add(("Driver Info : {0}" -f $Nic.DriverInformation))
     $report.Add('')
+
+    # Statistics
     $report.Add('Statistics:')
     $report.Add(("  RX Packets : {0}" -f $rxPackets))
     $report.Add(("  TX Packets : {0}" -f $txPackets))
@@ -313,7 +451,56 @@ function New-NICReport {
     $report.Add(("  TX Discards: {0}" -f $txDiscards))
     $report.Add('')
 
-    # Visible advanced
+    # Stack / offload / power
+    $report.Add('Stack/Offload/Power:')
+    $caps = Get-NICStackCaps -Name $Nic.Name
+    if ($caps) {
+        $caps.PSObject.Properties | ForEach-Object { $report.Add(("  {0}: {1}" -f $_.Name, $_.Value)) }
+    } else {
+        $report.Add('  (No data)')
+    }
+    $report.Add('------------------------------------')
+
+    # Connectivity checks
+    $report.Add('Connectivity Checks:')
+    $basics = Test-NICBasics -IfIndex $Nic.ifIndex
+    if ($basics) {
+        $basics.PSObject.Properties | ForEach-Object { $report.Add(("  {0}: {1}" -f $_.Name, $_.Value)) }
+    } else {
+        $report.Add('  (No data)')
+    }
+    $report.Add('------------------------------------')
+
+    # Routes + ARP
+    Add-NetworkTablesToReport -Report $report -IfIndex $Nic.ifIndex
+
+    # RSS mapping (if present)
+    $rssMap = Get-NICRssMapping -Name $Nic.Name
+    if ($rssMap) {
+        $report.Add('RSS Mapping:')
+        $rssMap.PSObject.Properties | ForEach-Object { $report.Add(("  {0}: {1}" -f $_.Name, $_.Value)) }
+        $report.Add('------------------------------------')
+    }
+
+    # LLDP neighbor (if available)
+    $lldp = Try-LLDPNeighbor
+    if ($lldp) {
+        $report.Add('LLDP Neighbor:')
+        foreach ($n in $lldp | Where-Object { $_.InterfaceAlias -eq $Nic.Name }) {
+            $report.Add(("  Chassis:{0}  Port:{1}  SysName:{2}" -f $n.ChassisId, $n.PortId, $n.SystemName))
+        }
+        $report.Add('------------------------------------')
+    }
+
+    # Driver package details
+    $d = Get-NICDriverDetail -PnpDeviceID $Nic.PnPDeviceID
+    if ($d) {
+        $report.Add('Driver Package Detail:')
+        $d.PSObject.Properties | ForEach-Object { $report.Add(("  {0}: {1}" -f $_.Name, $_.Value)) }
+        $report.Add('------------------------------------')
+    }
+
+    # Visible Advanced
     $report.Add('Advanced Properties:')
     if ($driver) {
         foreach ($prop in $driver) { $report.Add(("  {0}: {1}" -f $prop.DisplayName, $prop.DisplayValue)) }
@@ -322,7 +509,7 @@ function New-NICReport {
     }
     $report.Add('------------------------------------')
 
-    # Hidden advanced
+    # Hidden Advanced
     try { $hidden = Get-NICHiddenAdvancedProperties -Name $Nic.Name } catch { $hidden = @() }
     $report.Add('Advanced Properties (hidden):')
     if ($hidden -and $hidden.Count -gt 0) {
@@ -336,10 +523,22 @@ function New-NICReport {
     }
     $report.Add('------------------------------------')
 
+    # Recent events
+    $report.Add('Recent NIC/System Events (last 1h):')
+    $ev = Get-NICRecentEvents -Name $Nic.Name -Hours 1
+    if ($ev) {
+        foreach ($e in $ev) {
+            $report.Add(("  [{0}] {1}/{2} {3}" -f $e.TimeCreated, $e.ProviderName, $e.Id, $e.LevelDisplayName))
+        }
+    } else {
+        $report.Add('  (No recent events.)')
+    }
+    $report.Add('------------------------------------')
+
     # TXT
     $report | Out-File -FilePath $TxtFile -Encoding UTF8
 
-    # Console output (colors)
+    # Console (colors for Advanced/Errors/Discards)
     Write-Host ""
     Write-Host "===============================" -ForegroundColor Cyan
     Write-Host " NIC Diagnostic Report" -ForegroundColor Cyan
@@ -382,12 +581,21 @@ function New-NICReport {
     # HTML
     Write-NICHtmlReport -ReportLines $report.ToArray() -NicName $Nic.Name -HtmlPath $HtmlFile
 
-    # Return file paths
-    [PSCustomObject]@{ Csv = $CsvFile; Txt = $TxtFile; Html = $HtmlFile }
+    # JSON snapshot + ZIP bundle
+    $jsonPath = [IO.Path]::ChangeExtension($HtmlFile, '.json')
+    Save-JsonSnapshot -Path $jsonPath -Data @{
+        Adapter = $Nic.Name
+        Basics  = $basics
+        Caps    = $caps
+    }
+    $zip = Zip-Run -Csv $CsvFile -Txt $TxtFile -Html $HtmlFile -Json $jsonPath
+
+    # Emit file paths
+    [PSCustomObject]@{ Csv = $CsvFile; Txt = $TxtFile; Html = $HtmlFile; Zip = $zip }
 }
 
 # =====================================================
-# 5) Interactive menu (no flags)
+# 6) Interactive menu (no flags)
 # =====================================================
 while ($true) {
     $allAdapters = @(Get-NetAdapter | Sort-Object -Property Name)
@@ -427,6 +635,7 @@ while ($true) {
         Write-Host ("1) CSV : {0}" -f $files.Csv)
         Write-Host ("2) TXT : {0}" -f $files.Txt)
         Write-Host ("3) HTML: {0}" -f $files.Html)
+        Write-Host ("4) ZIP : {0}" -f $files.Zip)
 
         $open = Read-Host "Open? (1=CSV,2=TXT,3=HTML,F=folder,N=none,Q=quit)"
         switch -Regex ($open) {
