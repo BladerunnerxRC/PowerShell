@@ -1,17 +1,8 @@
-param(
-    [switch] $All,
-    [string] $AdapterName,
-    [string] $OutFolder = "C:\Users\Thoma\OneDrive\Documents\!_DIAGNOSTICS",
-    [switch] $OpenHtml,
-    [switch] $Once
-)
-
 <#
 .SYNOPSIS
-    Interactive NIC diagnostic report generator (TXT/CSV/HTML).
-    - HTML uses <pre> (no extra gaps) and colors values.
-    - Any "Disabled" in Advanced value (anywhere) -> yellow.
-    - Non-interactive flags: -All, -AdapterName, -Once, -OpenHtml.
+  Interactive NIC diagnostic report (TXT/CSV/HTML).
+  - Always adds hidden Advanced properties from Registry for the selected NIC.
+  - HTML uses <pre> (no blank gaps); “Disabled” anywhere → yellow.
 #>
 
 # ==============================
@@ -54,19 +45,97 @@ $null = Enable-ConsoleAnsi
 # ==============================
 # 1) Paths & ANSI strings
 # ==============================
-if (-not (Test-Path $OutFolder)) {
-    New-Item -ItemType Directory -Path $OutFolder -Force | Out-Null
-}
-$ESC        = [char]27 + "["
-$BOLD       = "${ESC}1m"
-$UNDERLINE  = "${ESC}4m"
-$RESET      = "${ESC}0m"
-$GREEN      = "${ESC}32m"
-$YELLOW     = "${ESC}33m"
-$LIGHTBLUE  = "${ESC}94m"
+$OutFolder = "C:\Users\Thoma\OneDrive\Documents\!_DIAGNOSTICS"
+if (-not (Test-Path $OutFolder)) { New-Item -ItemType Directory -Path $OutFolder -Force | Out-Null }
+
+$ESC       = [char]27 + "["
+$BOLD      = "${ESC}1m"
+$UNDERLINE = "${ESC}4m"
+$RESET     = "${ESC}0m"
+$GREEN     = "${ESC}32m"
+$YELLOW    = "${ESC}33m"
+$LIGHTBLUE = "${ESC}94m"
 
 # =====================================================
-# 2) HTML writer — single <pre>, no line gaps
+# 2) Registry discovery of hidden Advanced properties
+# =====================================================
+function Get-NICHiddenAdvancedProperties {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$Name)
+
+    $classGuidPath = 'HKLM:\SYSTEM\CurrentControlSet\Control\Class\{4d36e972-e325-11ce-bfc1-08002be10318}'
+    $nic = Get-NetAdapter -Name $Name -ErrorAction Stop
+    $guidB = $nic.InterfaceGuid.ToString("B")
+
+    $devKey = Get-ChildItem $classGuidPath -ErrorAction Stop |
+              Where-Object {
+                  try { (Get-ItemProperty $_.PsPath -ErrorAction Stop).NetCfgInstanceId -eq $guidB } catch { $false }
+              } | Select-Object -First 1
+    if (-not $devKey) { return @() }
+
+    $devProps  = Get-ItemProperty -Path $devKey.PSPath
+    $paramsKey = Join-Path $devKey.PSPath 'Ndi\Params'
+    $out = @()
+
+    $shown = @(Get-NetAdapterAdvancedProperty -Name $nic.Name -ErrorAction SilentlyContinue)
+    $shownKeywords = $shown.RegistryKeyword | Where-Object { $_ } | Select-Object -Unique
+
+    if (Test-Path $paramsKey) {
+        foreach ($p in Get-ChildItem $paramsKey) {
+            $pp       = Get-ItemProperty $p.PSPath
+            $valName  = $p.PSChildName
+            $desc     = $pp.ParamDesc
+            $type     = $pp.type
+            $default  = $pp.Default
+
+            $curr = $null
+            if ($null -ne $devProps.$valName)          { $curr = $devProps.$valName }
+            elseif ($null -ne $devProps.("*$valName")) { $curr = $devProps.("*$valName") }
+
+            $enumMap = @{}
+            $enumKey = Join-Path $p.PSPath 'enum'
+            if (Test-Path $enumKey) {
+                foreach ($e in Get-ChildItem $enumKey) {
+                    $ep = Get-ItemProperty $e.PSPath
+                    $enumMap[$e.PSChildName] = $ep.'(default)'
+                }
+            }
+            $currStr  = if ($null -eq $curr) { $null } else { [string]$curr }
+            $currDisp = if ($currStr -and $enumMap.ContainsKey($currStr)) { $enumMap[$currStr] } else { $currStr }
+
+            $shownHere = ($shownKeywords -contains $valName) -or ($shownKeywords -contains "*$valName")
+            $out += [PSCustomObject]@{
+                ParamKey     = $valName
+                ParamDesc    = $desc
+                Type         = $type
+                Default      = $default
+                CurrentValue = $currDisp
+                Hidden       = -not $shownHere
+            }
+        }
+    }
+
+    # Heuristic extras on device key with no Params entry
+    foreach ($propName in (Get-Item $devKey.PSPath).Property) {
+        if ($propName -match '^\*' -or $propName -cmatch '^(Jumbo|RSS|Flow|Vlan|Speed|Duplex|Interrupt|EEE|Lso|Checksum|Recv|Send|ARPOffload|NSOffload|LsoV2|IPv4|IPv6)') {
+            if (-not ($out.ParamKey -contains $propName.TrimStart('*'))) {
+                $out += [PSCustomObject]@{
+                    ParamKey     = $propName.TrimStart('*')
+                    ParamDesc    = $null
+                    Type         = $null
+                    Default      = $null
+                    CurrentValue = [string]$devProps.$propName
+                    Hidden       = $true
+                }
+            }
+        }
+    }
+
+    $out | Where-Object Hidden | Sort-Object ParamKey
+}
+
+# =====================================================
+# 3) HTML writer — single <pre>, handles both sections
 # =====================================================
 function Write-NICHtmlReport {
     param(
@@ -112,7 +181,9 @@ function Write-NICHtmlReport {
 
         if ($enc -eq '===============================') { $html.Add('<span class="dim">' + $enc + '</span>'); continue }
 
-        if ($enc -eq 'Advanced Properties:') { $html.Add('<span class="b">' + $enc + '</span>'); $inAdv = $true; continue }
+        if ($enc -eq 'Advanced Properties:' -or $enc -eq 'Advanced Properties (hidden):') {
+            $html.Add('<span class="b">' + $enc + '</span>'); $inAdv = $true; continue
+        }
 
         if ($inAdv -and $enc -eq '------------------------------------') { $html.Add('<span class="dim">' + $enc + '</span>'); $inAdv = $false; continue }
 
@@ -145,17 +216,17 @@ function Write-NICHtmlReport {
         }
 
         $html.Add($enc)
-    } # closes foreach
+    }
 
     $html.Add('</pre>')
     $html.Add('</body>')
     $html.Add('</html>')
 
     $html -join "`r`n" | Out-File -FilePath $HtmlPath -Encoding UTF8
-} # end Write-NICHtmlReport
+}
 
 # =====================================================
-# 3) New-NICReport (null-safe + short lines)
+# 4) New-NICReport (adds hidden section)
 # =====================================================
 function New-NICReport {
     param(
@@ -194,7 +265,8 @@ function New-NICReport {
     $jumboSetting = ($driver | Where-Object { $_.DisplayName -match 'Jumbo' }).DisplayValue
     if (-not $jumboSetting) { $jumboSetting = "N/A" }
 
-    $csvObj = [PSCustomObject]@{
+    # CSV
+    [PSCustomObject]@{
         Name          = $Nic.Name
         Description   = $Nic.InterfaceDescription
         Status        = $Nic.Status
@@ -212,9 +284,9 @@ function New-NICReport {
         TxErrors      = $txErrors
         RxDiscards    = $rxDiscards
         TxDiscards    = $txDiscards
-    }
-    $csvObj | Export-Csv -Path $CsvFile -NoTypeInformation -Encoding UTF8
+    } | Export-Csv -Path $CsvFile -NoTypeInformation -Encoding UTF8
 
+    # TEXT report
     $report = New-Object System.Collections.Generic.List[string]
     $report.Add('===============================')
     $report.Add(' NIC Diagnostic Report')
@@ -240,13 +312,34 @@ function New-NICReport {
     $report.Add(("  RX Discards: {0}" -f $rxDiscards))
     $report.Add(("  TX Discards: {0}" -f $txDiscards))
     $report.Add('')
+
+    # Visible advanced
     $report.Add('Advanced Properties:')
-    if ($driver) { foreach ($prop in $driver) { $report.Add(("  {0}: {1}" -f $prop.DisplayName, $prop.DisplayValue)) } }
-    else { $report.Add('  (No advanced properties found or access denied.)') }
+    if ($driver) {
+        foreach ($prop in $driver) { $report.Add(("  {0}: {1}" -f $prop.DisplayName, $prop.DisplayValue)) }
+    } else {
+        $report.Add('  (No advanced properties found or access denied.)')
+    }
     $report.Add('------------------------------------')
 
+    # Hidden advanced
+    try { $hidden = Get-NICHiddenAdvancedProperties -Name $Nic.Name } catch { $hidden = @() }
+    $report.Add('Advanced Properties (hidden):')
+    if ($hidden -and $hidden.Count -gt 0) {
+        foreach ($h in $hidden) {
+            $dispName = if ($h.ParamDesc) { $h.ParamDesc } else { $h.ParamKey }
+            $curr     = if ($h.CurrentValue) { $h.CurrentValue } else { "" }
+            $report.Add(("  {0}: {1}" -f $dispName, $curr))
+        }
+    } else {
+        $report.Add('  (No hidden properties discovered.)')
+    }
+    $report.Add('------------------------------------')
+
+    # TXT
     $report | Out-File -FilePath $TxtFile -Encoding UTF8
 
+    # Console output (colors)
     Write-Host ""
     Write-Host "===============================" -ForegroundColor Cyan
     Write-Host " NIC Diagnostic Report" -ForegroundColor Cyan
@@ -256,7 +349,9 @@ function New-NICReport {
 
     $inAdv2 = $false
     foreach ($line in $report) {
-        if ($line -eq 'Advanced Properties:') { Write-Host ("{0}{1}{2}" -f $BOLD, $line, $RESET); $inAdv2 = $true; continue }
+        if ($line -eq 'Advanced Properties:' -or $line -eq 'Advanced Properties (hidden):') {
+            Write-Host ("{0}{1}{2}" -f $BOLD, $line, $RESET); $inAdv2 = $true; continue
+        }
         if ($inAdv2 -and $line -eq '------------------------------------') { Write-Host $line; $inAdv2 = $false; continue }
 
         if ($inAdv2) {
@@ -284,49 +379,16 @@ function New-NICReport {
         Write-Host $line
     }
 
+    # HTML
     Write-NICHtmlReport -ReportLines $report.ToArray() -NicName $Nic.Name -HtmlPath $HtmlFile
-    if ($OpenHtml) { try { Start-Process $HtmlFile } catch {} }
 
+    # Return file paths
     [PSCustomObject]@{ Csv = $CsvFile; Txt = $TxtFile; Html = $HtmlFile }
-} # end New-NICReport
+}
 
 # =====================================================
-# 4) Main — interactive / non-interactive
+# 5) Interactive menu (no flags)
 # =====================================================
-$allAdapters = @(Get-NetAdapter | Sort-Object -Property Name)
-
-if ($All) {
-    if (-not $allAdapters) { Write-Host "No adapters found." -ForegroundColor Red; exit 1 }
-    foreach ($nic in $allAdapters) {
-        $files = New-NICReport -Nic $nic -OutFolder $OutFolder `
-            -BOLD $BOLD -UNDERLINE $UNDERLINE -RESET $RESET `
-            -GREEN $GREEN -YELLOW $YELLOW -LIGHTBLUE $LIGHTBLUE
-        Write-Host ("HTML: {0}" -f $files.Html)
-    }
-    exit 0
-}
-
-if ($AdapterName) {
-    $nic = $allAdapters | Where-Object { $_.Name -eq $AdapterName }
-    if (-not $nic) { Write-Host "Adapter '$AdapterName' not found." -ForegroundColor Red; exit 1 }
-    $files = New-NICReport -Nic $nic -OutFolder $OutFolder `
-        -BOLD $BOLD -UNDERLINE $UNDERLINE -RESET $RESET `
-        -GREEN $GREEN -YELLOW $YELLOW -LIGHTBLUE $LIGHTBLUE
-    Write-Host ("HTML: {0}" -f $files.Html)
-    if ($Once) { exit 0 }
-}
-
-if ($Once -and -not $AdapterName -and -not $All) {
-    if (-not $allAdapters) { Write-Host "No adapters found." -ForegroundColor Red; exit 1 }
-    $nic = $allAdapters[0]
-    $files = New-NICReport -Nic $nic -OutFolder $OutFolder `
-        -BOLD $BOLD -UNDERLINE $UNDERLINE -RESET $RESET `
-        -GREEN $GREEN -YELLOW $YELLOW -LIGHTBLUE $LIGHTBLUE
-    Write-Host ("HTML: {0}" -f $files.Html)
-    exit 0
-}
-
-# Interactive loop
 while ($true) {
     $allAdapters = @(Get-NetAdapter | Sort-Object -Property Name)
     if (-not $allAdapters) { Write-Host "No adapters found." -ForegroundColor Red; break }
