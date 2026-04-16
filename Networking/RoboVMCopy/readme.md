@@ -5,9 +5,12 @@ Windows PowerShell GUI wrapper for RoboCopy.
 RoboVMCopy lets you:
 
 - Pick any source folder and destination folder on Windows
+- Browse with a dialog that can access local and mapped drives
 - Toggle common RoboCopy options in a GUI
 - Run and stop copy jobs with live output
+- Save each run output to a timestamped log file
 - Save copy jobs as quick-launch buttons
+- Edit or delete saved jobs from the context menu
 - Re-run saved jobs with one click
 
 ## Files
@@ -46,6 +49,8 @@ powershell -STA -ExecutionPolicy Bypass -File "C:\Path\To\RoboVMCopy.ps1"
 
 To stop a running copy, click **Stop**.
 
+By default, **Keep app open after copy** is enabled, so the window does not close after a job finishes.
+
 ## Save Jobs To Buttons
 
 1. Set Source and Destination.
@@ -56,7 +61,21 @@ To stop a running copy, click **Stop**.
 Saved jobs appear in the **Saved Jobs** panel.
 
 - Left click saved button: runs the job immediately
-- Right click saved button: load paths, run job, or delete job
+- Right click saved button: load paths, edit, run, or delete job
+
+To edit a saved job:
+
+1. Right click the saved job button.
+2. Click **Edit job**.
+3. Update values in the main form.
+4. Click **Save Job** to overwrite.
+
+Delete prompts for confirmation before removal.
+
+## Run Logs
+
+- Every run writes output to `Logs/RoboCopy_yyyyMMdd_HHmmss.log`
+- The full path is shown in the output log when a run starts and when it finishes
 
 ## Built-In Option Controls
 

@@ -1,4 +1,4 @@
-- Add delete and edit saved jobs
-- show robocopy output and save a log with date and time appended to filename
-- Stop the application from exiting after copy
-- Find a way to show mapped drives on local PC when browsing
+- [x] Add delete and edit saved jobs
+- [x] Show robocopy output and save a log with date and time appended to filename
+- [x] Stop the application from exiting after copy
+- [x] Find a way to show mapped drives on local PC when browsing

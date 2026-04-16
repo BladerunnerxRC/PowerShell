@@ -26,6 +26,36 @@ $script:ConfigFile = Join-Path $PSScriptRoot 'RoboVMCopy_Jobs.json'
 $script:RoboProcess = $null
 $script:OutputQueue = [System.Collections.Concurrent.ConcurrentQueue[string]]::new()
 $script:PollTimer = $null
+$script:RunLogWriter = $null
+$script:RunLogPath = $null
+
+function Close-RunLog {
+    if ($script:RunLogWriter) {
+        try {
+            $script:RunLogWriter.Flush()
+            $script:RunLogWriter.Dispose()
+        }
+        catch {
+        }
+        finally {
+            $script:RunLogWriter = $null
+        }
+    }
+}
+
+function Start-RunLog {
+    Close-RunLog
+
+    $logDir = Join-Path $PSScriptRoot 'Logs'
+    if (-not (Test-Path -LiteralPath $logDir)) {
+        New-Item -Path $logDir -ItemType Directory -Force | Out-Null
+    }
+
+    $stamp = Get-Date -Format 'yyyyMMdd_HHmmss'
+    $script:RunLogPath = Join-Path $logDir ("RoboCopy_{0}.log" -f $stamp)
+    $script:RunLogWriter = New-Object System.IO.StreamWriter($script:RunLogPath, $false, [System.Text.Encoding]::UTF8)
+    $script:RunLogWriter.AutoFlush = $true
+}
 
 function Get-Jobs {
     if (Test-Path -LiteralPath $script:ConfigFile) {
@@ -89,6 +119,44 @@ function New-SectionHeader {
     $label.Font = New-Object System.Drawing.Font('Segoe UI', 8, [System.Drawing.FontStyle]::Bold)
     $label.ForeColor = $ForeColor
     $Parent.Controls.Add($label)
+}
+
+function Select-FolderPath {
+    param(
+        [string]$InitialPath,
+        [string]$Title
+    )
+
+    # Use OpenFileDialog in folder-select mode to better expose mapped drives and This PC.
+    $dlg = New-Object System.Windows.Forms.OpenFileDialog
+    $dlg.Title = $Title
+    $dlg.Filter = 'Folders|*.folder'
+    $dlg.CheckFileExists = $false
+    $dlg.CheckPathExists = $true
+    $dlg.ValidateNames = $false
+    $dlg.FileName = 'Select Folder'
+    $dlg.DereferenceLinks = $true
+
+    if ($InitialPath -and (Test-Path -LiteralPath $InitialPath)) {
+        $dlg.InitialDirectory = $InitialPath
+    }
+
+    try {
+        if ($dlg.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
+            $candidate = Split-Path -Path $dlg.FileName -Parent
+            if (-not $candidate) {
+                $candidate = $dlg.FileName
+            }
+            if (Test-Path -LiteralPath $candidate) {
+                return $candidate
+            }
+        }
+    }
+    finally {
+        $dlg.Dispose()
+    }
+
+    return $null
 }
 
 # Colors (ASCII-safe only)
@@ -267,7 +335,7 @@ $panOpts.Controls.Add($script:tbExtra)
 # Action panel
 $panAction = New-Object System.Windows.Forms.Panel
 $panAction.Location = [System.Drawing.Point]::new(10, 256)
-$panAction.Size = [System.Drawing.Size]::new(940, 44)
+$panAction.Size = [System.Drawing.Size]::new(940, 64)
 $panAction.BackColor = $clrBg
 $panAction.Anchor = 'Top,Left,Right'
 $script:form.Controls.Add($panAction)
@@ -295,20 +363,30 @@ $script:tbJobName.BorderStyle = 'FixedSingle'
 $script:tbJobName.Anchor = 'Top,Left,Right'
 $panAction.Controls.Add($script:tbJobName)
 
+$script:cbKeepOpen = New-Object System.Windows.Forms.CheckBox
+$script:cbKeepOpen.Text = 'Keep app open after copy'
+$script:cbKeepOpen.Location = [System.Drawing.Point]::new(274, 38)
+$script:cbKeepOpen.Size = [System.Drawing.Size]::new(188, 18)
+$script:cbKeepOpen.ForeColor = $clrMuted
+$script:cbKeepOpen.BackColor = $clrBg
+$script:cbKeepOpen.Checked = $true
+$script:cbKeepOpen.Cursor = [System.Windows.Forms.Cursors]::Hand
+$panAction.Controls.Add($script:cbKeepOpen)
+
 $btnSaveJob = New-FlatButton -Text 'Save Job' -Parent $panAction -X 766 -Y 5 -W 160 -H 34 -BackColor $clrBlue -ForeColor ([System.Drawing.Color]::White)
 $btnSaveJob.Anchor = 'Top,Right'
 
 # Jobs panel
 $lblJobsHdr = New-Object System.Windows.Forms.Label
-$lblJobsHdr.Text = 'SAVED JOBS (left click = run | right click = options)'
-$lblJobsHdr.Location = [System.Drawing.Point]::new(10, 308)
+$lblJobsHdr.Text = 'SAVED JOBS (left click = run | right click = load/edit/run/delete)'
+$lblJobsHdr.Location = [System.Drawing.Point]::new(10, 328)
 $lblJobsHdr.AutoSize = $true
 $lblJobsHdr.Font = New-Object System.Drawing.Font('Segoe UI', 8, [System.Drawing.FontStyle]::Bold)
 $lblJobsHdr.ForeColor = $clrBlue
 $script:form.Controls.Add($lblJobsHdr)
 
 $script:panJobs = New-Object System.Windows.Forms.FlowLayoutPanel
-$script:panJobs.Location = [System.Drawing.Point]::new(10, 328)
+$script:panJobs.Location = [System.Drawing.Point]::new(10, 348)
 $script:panJobs.Size = [System.Drawing.Size]::new(940, 88)
 $script:panJobs.BackColor = $clrPanel
 $script:panJobs.AutoScroll = $true
@@ -321,18 +399,18 @@ $script:form.Controls.Add($script:panJobs)
 # Log panel
 $lblLogHdr = New-Object System.Windows.Forms.Label
 $lblLogHdr.Text = 'OUTPUT LOG'
-$lblLogHdr.Location = [System.Drawing.Point]::new(10, 424)
+$lblLogHdr.Location = [System.Drawing.Point]::new(10, 444)
 $lblLogHdr.AutoSize = $true
 $lblLogHdr.Font = New-Object System.Drawing.Font('Segoe UI', 8, [System.Drawing.FontStyle]::Bold)
 $lblLogHdr.ForeColor = $clrBlue
 $script:form.Controls.Add($lblLogHdr)
 
-$btnClearLog = New-FlatButton -Text 'Clear' -Parent $script:form -X 896 -Y 420 -W 54 -H 22 -BackColor $clrAlt -ForeColor $clrText
+$btnClearLog = New-FlatButton -Text 'Clear' -Parent $script:form -X 896 -Y 440 -W 54 -H 22 -BackColor $clrAlt -ForeColor $clrText
 $btnClearLog.Anchor = 'Top,Right'
 
 $script:rtLog = New-Object System.Windows.Forms.RichTextBox
-$script:rtLog.Location = [System.Drawing.Point]::new(10, 446)
-$script:rtLog.Size = [System.Drawing.Size]::new(940, 274)
+$script:rtLog.Location = [System.Drawing.Point]::new(10, 466)
+$script:rtLog.Size = [System.Drawing.Size]::new(940, 254)
 $script:rtLog.BackColor = $clrLogBg
 $script:rtLog.ForeColor = [System.Drawing.Color]::FromArgb(180, 230, 180)
 $script:rtLog.Font = New-Object System.Drawing.Font('Consolas', 9)
@@ -365,6 +443,15 @@ function Write-Log {
     $script:rtLog.SelectionColor = $Color
     $script:rtLog.AppendText("$Text`r`n")
     $script:rtLog.ScrollToCaret()
+
+    if ($script:RunLogWriter) {
+        try {
+            $line = "[{0}] {1}" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $Text
+            $script:RunLogWriter.WriteLine($line)
+        }
+        catch {
+        }
+    }
 }
 
 function Get-SelectedFlags {
@@ -386,6 +473,76 @@ function Get-SelectedFlags {
     }
 
     return ($flags -join ' ')
+}
+
+function Apply-FlagsToControls {
+    param([string]$Flags)
+
+    foreach ($cb in $script:checkboxes.Values) {
+        $cb.Checked = $false
+    }
+
+    $script:nudMT.Value = 8
+    $script:nudR.Value = 3
+    $script:nudW.Value = 5
+    $script:tbExtra.Text = ''
+
+    $extras = [System.Collections.Generic.List[string]]::new()
+    $tokens = @()
+
+    if ($Flags) {
+        $tokens = $Flags -split '\s+'
+    }
+
+    foreach ($tok in $tokens) {
+        if (-not $tok) {
+            continue
+        }
+
+        if ($script:checkboxes.ContainsKey($tok)) {
+            $script:checkboxes[$tok].Checked = $true
+            continue
+        }
+
+        if ($tok -match '^/MT:(\d+)$') {
+            $v = [int]$Matches[1]
+            if ($v -lt $script:nudMT.Minimum) { $v = [int]$script:nudMT.Minimum }
+            if ($v -gt $script:nudMT.Maximum) { $v = [int]$script:nudMT.Maximum }
+            $script:nudMT.Value = $v
+            continue
+        }
+
+        if ($tok -match '^/R:(\d+)$') {
+            $v = [int]$Matches[1]
+            if ($v -lt $script:nudR.Minimum) { $v = [int]$script:nudR.Minimum }
+            if ($v -gt $script:nudR.Maximum) { $v = [int]$script:nudR.Maximum }
+            $script:nudR.Value = $v
+            continue
+        }
+
+        if ($tok -match '^/W:(\d+)$') {
+            $v = [int]$Matches[1]
+            if ($v -lt $script:nudW.Minimum) { $v = [int]$script:nudW.Minimum }
+            if ($v -gt $script:nudW.Maximum) { $v = [int]$script:nudW.Maximum }
+            $script:nudW.Value = $v
+            continue
+        }
+
+        $extras.Add($tok)
+    }
+
+    $script:tbExtra.Text = ($extras -join ' ')
+}
+
+function Load-JobIntoEditor {
+    param([object]$Job)
+
+    $script:tbJobName.Text = [string]$Job.Name
+    $script:tbSource.Text = [string]$Job.Source
+    $script:tbDest.Text = [string]$Job.Destination
+    Apply-FlagsToControls -Flags ([string]$Job.Flags)
+
+    Write-Log "Loaded job for editing: $($Job.Name)" ([System.Drawing.Color]::FromArgb(120, 180, 255))
 }
 
 function Refresh-JobButtons {
@@ -447,6 +604,16 @@ function Refresh-JobButtons {
             }
         })
 
+        $miEdit = New-Object System.Windows.Forms.ToolStripMenuItem 'Edit job'
+        $miEdit.Add_Click({
+            param($s, $e)
+            $strip = $s.GetCurrentParent()
+            if ($strip -is [System.Windows.Forms.ContextMenuStrip] -and $strip.SourceControl) {
+                $j = $strip.SourceControl.Tag
+                Load-JobIntoEditor -Job $j
+            }
+        })
+
         $miRun = New-Object System.Windows.Forms.ToolStripMenuItem 'Run this job'
         $miRun.Add_Click({
             param($s, $e)
@@ -466,6 +633,17 @@ function Refresh-JobButtons {
             $strip = $s.GetCurrentParent()
             if ($strip -is [System.Windows.Forms.ContextMenuStrip] -and $strip.SourceControl) {
                 $jobName = $strip.SourceControl.Tag.Name
+
+                $ans = [System.Windows.Forms.MessageBox]::Show(
+                    "Delete saved job '$jobName'?",
+                    'Confirm Delete',
+                    [System.Windows.Forms.MessageBoxButtons]::YesNo,
+                    [System.Windows.Forms.MessageBoxIcon]::Question
+                )
+                if ($ans -ne [System.Windows.Forms.DialogResult]::Yes) {
+                    return
+                }
+
                 $remaining = @(Get-Jobs | Where-Object { $_.Name -ne $jobName })
                 Save-AllJobs -Jobs $remaining
                 Refresh-JobButtons
@@ -474,6 +652,7 @@ function Refresh-JobButtons {
         })
 
         $ctx.Items.Add($miLoad) | Out-Null
+        $ctx.Items.Add($miEdit) | Out-Null
         $ctx.Items.Add($miRun) | Out-Null
         $ctx.Items.Add([System.Windows.Forms.ToolStripSeparator]::new()) | Out-Null
         $ctx.Items.Add($miDel) | Out-Null
@@ -517,6 +696,8 @@ function Start-RoboCopyJob {
         $script:PollTimer.Stop()
     }
 
+    Start-RunLog
+
     $script:btnRun.Enabled = $false
     $script:btnStop.Enabled = $true
     $script:statusLabel.Text = 'Running...'
@@ -525,6 +706,7 @@ function Start-RoboCopyJob {
     $cmdArgs = "`"$Src`" `"$Dst`" $Flags"
     Write-Log ('-' * 90) ([System.Drawing.Color]::FromArgb(55, 55, 70))
     Write-Log "robocopy $cmdArgs" ([System.Drawing.Color]::FromArgb(120, 180, 255))
+    Write-Log "Run log file: $($script:RunLogPath)" ([System.Drawing.Color]::FromArgb(120, 180, 255))
 
     $script:OutputQueue = [System.Collections.Concurrent.ConcurrentQueue[string]]::new()
 
@@ -582,6 +764,13 @@ function Start-RoboCopyJob {
         if ($script:RoboProcess.HasExited -and $script:OutputQueue.IsEmpty) {
             $script:PollTimer.Stop()
 
+            if ($script:RunLogWriter) {
+                Close-RunLog
+                if ($script:RunLogPath) {
+                    Write-Log "Saved run log to: $($script:RunLogPath)" ([System.Drawing.Color]::FromArgb(120, 180, 255))
+                }
+            }
+
             if (-not $script:btnRun.Enabled) {
                 $exit = $script:RoboProcess.ExitCode
                 Write-Log ('-' * 90) ([System.Drawing.Color]::FromArgb(55, 55, 70))
@@ -604,6 +793,14 @@ function Start-RoboCopyJob {
                     $script:statusBar.BackColor = $clrRed
                 }
 
+                if ($script:cbKeepOpen.Checked) {
+                    Write-Log 'Copy finished. Application remains open.' ([System.Drawing.Color]::FromArgb(120, 180, 255))
+                }
+                else {
+                    Write-Log 'Copy finished. Closing application by user preference.' ([System.Drawing.Color]::FromArgb(255, 165, 0))
+                    $script:form.Close()
+                }
+
                 $script:btnRun.Enabled = $true
                 $script:btnStop.Enabled = $false
             }
@@ -615,36 +812,18 @@ function Start-RoboCopyJob {
 
 # Browse source
 $btnBrowseSrc.Add_Click({
-    $dlg = New-Object System.Windows.Forms.FolderBrowserDialog
-    $dlg.Description = 'Select the source folder to copy from'
-    $dlg.UseDescriptionForTitle = $true
-
-    if ($script:tbSource.Text -and (Test-Path -LiteralPath $script:tbSource.Text)) {
-        $dlg.SelectedPath = $script:tbSource.Text
+    $selected = Select-FolderPath -InitialPath $script:tbSource.Text -Title 'Select source folder (mapped drives visible in This PC)'
+    if ($selected) {
+        $script:tbSource.Text = $selected
     }
-
-    if ($dlg.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
-        $script:tbSource.Text = $dlg.SelectedPath
-    }
-
-    $dlg.Dispose()
 })
 
 # Browse destination
 $btnBrowseDst.Add_Click({
-    $dlg = New-Object System.Windows.Forms.FolderBrowserDialog
-    $dlg.Description = 'Select the destination folder to copy to'
-    $dlg.UseDescriptionForTitle = $true
-
-    if ($script:tbDest.Text -and (Test-Path -LiteralPath $script:tbDest.Text)) {
-        $dlg.SelectedPath = $script:tbDest.Text
+    $selected = Select-FolderPath -InitialPath $script:tbDest.Text -Title 'Select destination folder (mapped drives visible in This PC)'
+    if ($selected) {
+        $script:tbDest.Text = $selected
     }
-
-    if ($dlg.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
-        $script:tbDest.Text = $dlg.SelectedPath
-    }
-
-    $dlg.Dispose()
 })
 
 # Run
@@ -730,6 +909,7 @@ $script:form.Add_FormClosing({
     if ($script:PollTimer) {
         $script:PollTimer.Stop()
     }
+    Close-RunLog
 })
 
 Write-Log 'RoboVMCopy ready.' ([System.Drawing.Color]::FromArgb(120, 180, 255))
@@ -737,7 +917,8 @@ Write-Log '1. Browse for source and destination folders.' $clrMuted
 Write-Log '2. Pick your RoboCopy options.' $clrMuted
 Write-Log '3. Click Run RoboCopy, or save as a quick-launch job button.' $clrMuted
 Write-Log '4. Left click a saved button to run it.' $clrMuted
-Write-Log '5. Right click a saved button for load/delete options.' $clrMuted
+Write-Log '5. Right click a saved button for load/edit/run/delete options.' $clrMuted
+Write-Log '6. Every run is saved to Logs/RoboCopy_yyyyMMdd_HHmmss.log.' $clrMuted
 Write-Log '' $clrMuted
 
 Refresh-JobButtons
