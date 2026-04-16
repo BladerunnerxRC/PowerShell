@@ -7,8 +7,11 @@ RoboVMCopy lets you:
 - Pick any source folder and destination folder on Windows
 - Browse with a dialog that can access local and mapped drives
 - Toggle common RoboCopy options in a GUI
-- Run and stop copy jobs with live output
-- Save each run output to a timestamped log file
+- Run and stop copy jobs with live per-file output
+- Show the current file activity in a dedicated live status area
+- Show a visual overall progress bar tied to the live copy metrics
+- Show elapsed time, estimated completion time, and throughput in the status bar
+- Save each run output to a timestamped log file beside the script
 - Save copy jobs as quick-launch buttons
 - Edit or delete saved jobs from the context menu
 - Re-run saved jobs with one click
@@ -47,9 +50,15 @@ powershell -STA -ExecutionPolicy Bypass -File "C:\Path\To\RoboVMCopy.ps1"
 4. Click **Run RoboCopy**.
 5. Watch progress in **Output Log**.
 
+The **Current File** area shows the latest file activity during the run.
+
+The **Overall Progress** bar uses the same metric model as the status bar, so percentage, elapsed time, ETA, and throughput stay aligned.
+
+The status bar shows elapsed time, estimated completion time, and throughput in Mbps while the copy is running.
+
 To stop a running copy, click **Stop**.
 
-By default, **Keep app open after copy** is enabled, so the window does not close after a job finishes.
+The application stays open after a job finishes. It only closes when you click **Exit** and confirm.
 
 ## Save Jobs To Buttons
 
@@ -74,7 +83,7 @@ Delete prompts for confirmation before removal.
 
 ## Run Logs
 
-- Every run writes output to `Logs/RoboCopy_yyyyMMdd_HHmmss.log`
+- Every run writes output to `RoboCopy_yyyyMMdd_HHmmss.log` in the same folder as `RoboVMCopy.ps1`
 - The full path is shown in the output log when a run starts and when it finishes
 
 ## Built-In Option Controls
@@ -87,8 +96,6 @@ Checkbox options:
 - `/Z` - restartable mode
 - `/XA:H` - exclude hidden files
 - `/PURGE` - remove destination items not in source
-- `/NFL` - no file list output
-- `/NDL` - no directory list output
 
 Numeric options:
 
@@ -107,6 +114,14 @@ Extra flags:
 - `8+` indicates copy errors
 
 The status bar and output log show success and error states.
+
+Per-file RoboCopy output is always shown in the GUI, similar to the CLI view.
+
+The dedicated **Current File** panel highlights the most recent file activity without needing to scan the full log.
+
+The overall progress bar provides a quick visual estimate of how far the copy has advanced.
+
+The elapsed time and ETA are estimates based on the copy activity seen so far.
 
 ## Troubleshooting
 
@@ -140,6 +155,17 @@ powershell -STA -ExecutionPolicy Bypass -File .\RoboVMCopy.ps1
 - Run PowerShell as Administrator if needed
 - Close apps using those files
 - Add suitable RoboCopy retry flags
+
+### COPYALL fails with "Manage Auditing user right"
+
+Cause:
+
+- `/COPYALL` includes auditing information (`U`) and needs the Manage Auditing user right.
+
+Fix:
+
+- When prompted, choose **Yes** to run with `/COPY:DATS` for that run.
+- Or edit your saved job and remove `/COPYALL` if auditing copy is not required.
 
 ## Safety Notes
 

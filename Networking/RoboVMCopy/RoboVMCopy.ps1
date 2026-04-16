@@ -21,13 +21,63 @@ Add-Type -AssemblyName System.Drawing
 
 [System.Windows.Forms.Application]::EnableVisualStyles()
 [System.Windows.Forms.Application]::SetCompatibleTextRenderingDefault($false)
+[System.Windows.Forms.Application]::SetUnhandledExceptionMode([System.Windows.Forms.UnhandledExceptionMode]::CatchException)
 
-$script:ConfigFile = Join-Path $PSScriptRoot 'RoboVMCopy_Jobs.json'
+# Support both file execution and interactive terminal execution.
+$script:BasePath = if ($PSScriptRoot) {
+    $PSScriptRoot
+}
+elseif ($PSCommandPath) {
+    Split-Path -Path $PSCommandPath -Parent
+}
+else {
+    (Get-Location).Path
+}
+
+$script:ConfigFile = Join-Path $script:BasePath 'RoboVMCopy_Jobs.json'
 $script:RoboProcess = $null
 $script:OutputQueue = [System.Collections.Concurrent.ConcurrentQueue[string]]::new()
 $script:PollTimer = $null
 $script:RunLogWriter = $null
 $script:RunLogPath = $null
+$script:AllowClose = $false
+$script:LastFileActivity = ''
+$script:CopyStartTime = $null
+$script:SourceTotalBytes = 0L
+$script:ProcessedBytes = 0L
+$script:CopiedBytes = 0L
+$script:RawOutputPath = $null
+$script:RawOutputLineCount = 0
+$script:CrashLogPath = Join-Path $script:BasePath 'RoboVMCopy_Crash.log'
+
+function Write-CrashLog {
+    param([string]$Message)
+
+    try {
+        $line = "[{0}] {1}" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $Message
+        Add-Content -LiteralPath $script:CrashLogPath -Value $line -Encoding UTF8
+    }
+    catch {
+    }
+}
+
+[System.Windows.Forms.Application]::add_ThreadException({
+    param($sender, $e)
+    $msg = if ($e -and $e.Exception) { $e.Exception.ToString() } else { 'Unknown UI thread exception.' }
+    Write-CrashLog ("UI Thread Exception: {0}" -f $msg)
+    [System.Windows.Forms.MessageBox]::Show(
+        "Unexpected UI error captured. Details written to:`r`n$script:CrashLogPath`r`n`r`n$msg",
+        'RoboVMCopy Fatal Error',
+        [System.Windows.Forms.MessageBoxButtons]::OK,
+        [System.Windows.Forms.MessageBoxIcon]::Error
+    ) | Out-Null
+})
+
+[System.AppDomain]::CurrentDomain.add_UnhandledException({
+    param($sender, $e)
+    $msg = if ($e -and $e.ExceptionObject) { $e.ExceptionObject.ToString() } else { 'Unknown unhandled exception.' }
+    Write-CrashLog ("Unhandled Exception: {0}" -f $msg)
+})
 
 function Close-RunLog {
     if ($script:RunLogWriter) {
@@ -46,21 +96,125 @@ function Close-RunLog {
 function Start-RunLog {
     Close-RunLog
 
-    $logDir = Join-Path $PSScriptRoot 'Logs'
-    if (-not (Test-Path -LiteralPath $logDir)) {
-        New-Item -Path $logDir -ItemType Directory -Force | Out-Null
+    try {
+        $stamp = Get-Date -Format 'yyyyMMdd_HHmmss'
+        $script:RunLogPath = Join-Path $script:BasePath ("RoboCopy_{0}.log" -f $stamp)
+        $script:RunLogWriter = New-Object System.IO.StreamWriter($script:RunLogPath, $false, [System.Text.Encoding]::UTF8)
+        $script:RunLogWriter.AutoFlush = $true
+    }
+    catch {
+        $script:RunLogPath = $null
+        $script:RunLogWriter = $null
+    }
+}
+
+function Reset-RawOutputTracking {
+    $script:RawOutputPath = $null
+    $script:RawOutputLineCount = 0
+}
+
+function Get-NewRawOutputLines {
+    if (-not $script:RawOutputPath -or -not (Test-Path -LiteralPath $script:RawOutputPath)) {
+        return @()
     }
 
-    $stamp = Get-Date -Format 'yyyyMMdd_HHmmss'
-    $script:RunLogPath = Join-Path $logDir ("RoboCopy_{0}.log" -f $stamp)
-    $script:RunLogWriter = New-Object System.IO.StreamWriter($script:RunLogPath, $false, [System.Text.Encoding]::UTF8)
-    $script:RunLogWriter.AutoFlush = $true
+    try {
+        $lines = @(Get-Content -LiteralPath $script:RawOutputPath -ErrorAction SilentlyContinue)
+        if ($lines.Count -le $script:RawOutputLineCount) {
+            return @()
+        }
+
+        $newLines = @($lines[$script:RawOutputLineCount..($lines.Count - 1)])
+        $script:RawOutputLineCount = $lines.Count
+        return $newLines
+    }
+    catch {
+        return @()
+    }
+}
+
+function Normalize-Jobs {
+    param([object[]]$Jobs)
+
+    $cleanJobs = [System.Collections.Generic.List[object]]::new()
+
+    foreach ($job in @($Jobs)) {
+        if ($null -eq $job) {
+            continue
+        }
+
+        $name = [string]$job.Name
+        $source = [string]$job.Source
+        $destination = [string]$job.Destination
+
+        if ([string]::IsNullOrWhiteSpace($name)) {
+            continue
+        }
+
+        $cleanJobs.Add([PSCustomObject]@{
+            Name = $name.Trim()
+            Source = $source.Trim()
+            Destination = $destination.Trim()
+            Flags = (Normalize-FlagString -Flags ([string]$job.Flags))
+        })
+    }
+
+    return @($cleanJobs)
+}
+
+function Normalize-FlagString {
+    param([string]$Flags)
+
+    if (-not $Flags) {
+        return ''
+    }
+
+    $tokens = $Flags -split '\s+' | Where-Object {
+        $_ -and $_ -notin @('/NFL', '/NDL')
+    }
+
+    return ($tokens -join ' ').Trim()
+}
+
+function Resolve-RoboCopyPermissionFlags {
+    param([string]$Flags)
+
+    if (-not $Flags) {
+        return ''
+    }
+
+    $hasAuditingCopy = ($Flags -match '(?i)/COPYALL') -or ($Flags -match '(?i)/COPY:[A-Z]*U[A-Z]*')
+    if (-not $hasAuditingCopy) {
+        return $Flags
+    }
+
+    $choice = [System.Windows.Forms.MessageBox]::Show(
+        "Selected options include auditing copy (/COPYALL or /COPY:...U).`r`n`r`nWithout the Manage Auditing user right, RoboCopy returns exit code 16.`r`n`r`nUse /COPY:DATS for this run instead?",
+        'RoboCopy Permissions',
+        [System.Windows.Forms.MessageBoxButtons]::YesNoCancel,
+        [System.Windows.Forms.MessageBoxIcon]::Question
+    )
+
+    if ($choice -eq [System.Windows.Forms.DialogResult]::Cancel) {
+        Write-Log 'Run cancelled by user before launch.' ([System.Drawing.Color]::FromArgb(255, 165, 0))
+        return $null
+    }
+
+    if ($choice -eq [System.Windows.Forms.DialogResult]::Yes) {
+        $fixed = [System.Text.RegularExpressions.Regex]::Replace($Flags, '(?i)/COPYALL', '/COPY:DATS')
+        $fixed = [System.Text.RegularExpressions.Regex]::Replace($fixed, '(?i)/COPY:[A-Z]*U[A-Z]*', '/COPY:DATS')
+        Write-Log 'Using /COPY:DATS for this run to avoid auditing-right failures.' ([System.Drawing.Color]::FromArgb(255, 200, 120))
+        return $fixed
+    }
+
+    Write-Log 'Continuing with auditing copy flags; run may fail without Manage Auditing user right.' ([System.Drawing.Color]::FromArgb(255, 165, 0))
+    return $Flags
 }
 
 function Get-Jobs {
     if (Test-Path -LiteralPath $script:ConfigFile) {
         try {
-            return @(Get-Content -LiteralPath $script:ConfigFile -Raw -Encoding UTF8 | ConvertFrom-Json)
+            return @(Normalize-Jobs -Jobs @(Get-Content -LiteralPath $script:ConfigFile -Raw -Encoding UTF8 | ConvertFrom-Json))
         }
         catch {
             return @()
@@ -71,6 +225,8 @@ function Get-Jobs {
 
 function Save-AllJobs {
     param([object[]]$Jobs)
+
+    $Jobs = @(Normalize-Jobs -Jobs $Jobs)
 
     if ($null -eq $Jobs -or $Jobs.Count -eq 0) {
         Set-Content -LiteralPath $script:ConfigFile -Value '[]' -Encoding UTF8
@@ -253,8 +409,6 @@ $flagDefs = @(
     @{ F = '/Z';       D = 'Restartable mode' }
     @{ F = '/XA:H';    D = 'Exclude hidden files' }
     @{ F = '/PURGE';   D = 'Delete destination files not in source' }
-    @{ F = '/NFL';     D = 'No file list in output' }
-    @{ F = '/NDL';     D = 'No directory list in output' }
 )
 
 $script:checkboxes = @{}
@@ -347,6 +501,9 @@ $script:btnStop = New-FlatButton -Text 'Stop' -Parent $panAction -X 172 -Y 2 -W 
 $script:btnStop.Font = New-Object System.Drawing.Font('Segoe UI', 9, [System.Drawing.FontStyle]::Bold)
 $script:btnStop.Enabled = $false
 
+$script:btnExit = New-FlatButton -Text 'Exit' -Parent $panAction -X 844 -Y 5 -W 82 -H 34 -BackColor $clrAlt -ForeColor ([System.Drawing.Color]::White)
+$script:btnExit.Anchor = 'Top,Right'
+
 $lblSaveAs = New-Object System.Windows.Forms.Label
 $lblSaveAs.Text = 'Save as button:'
 $lblSaveAs.Location = [System.Drawing.Point]::new(274, 11)
@@ -363,17 +520,14 @@ $script:tbJobName.BorderStyle = 'FixedSingle'
 $script:tbJobName.Anchor = 'Top,Left,Right'
 $panAction.Controls.Add($script:tbJobName)
 
-$script:cbKeepOpen = New-Object System.Windows.Forms.CheckBox
-$script:cbKeepOpen.Text = 'Keep app open after copy'
-$script:cbKeepOpen.Location = [System.Drawing.Point]::new(274, 38)
-$script:cbKeepOpen.Size = [System.Drawing.Size]::new(188, 18)
-$script:cbKeepOpen.ForeColor = $clrMuted
-$script:cbKeepOpen.BackColor = $clrBg
-$script:cbKeepOpen.Checked = $true
-$script:cbKeepOpen.Cursor = [System.Windows.Forms.Cursors]::Hand
-$panAction.Controls.Add($script:cbKeepOpen)
+$lblExitHint = New-Object System.Windows.Forms.Label
+$lblExitHint.Text = 'The app stays open until you click Exit.'
+$lblExitHint.Location = [System.Drawing.Point]::new(274, 38)
+$lblExitHint.Size = [System.Drawing.Size]::new(250, 18)
+$lblExitHint.ForeColor = $clrMuted
+$panAction.Controls.Add($lblExitHint)
 
-$btnSaveJob = New-FlatButton -Text 'Save Job' -Parent $panAction -X 766 -Y 5 -W 160 -H 34 -BackColor $clrBlue -ForeColor ([System.Drawing.Color]::White)
+$btnSaveJob = New-FlatButton -Text 'Save Job' -Parent $panAction -X 678 -Y 5 -W 160 -H 34 -BackColor $clrBlue -ForeColor ([System.Drawing.Color]::White)
 $btnSaveJob.Anchor = 'Top,Right'
 
 # Jobs panel
@@ -397,20 +551,79 @@ $script:panJobs.Anchor = 'Top,Left,Right'
 $script:form.Controls.Add($script:panJobs)
 
 # Log panel
+$script:panCurrentFile = New-Object System.Windows.Forms.Panel
+$script:panCurrentFile.Location = [System.Drawing.Point]::new(10, 444)
+$script:panCurrentFile.Size = [System.Drawing.Size]::new(940, 42)
+$script:panCurrentFile.BackColor = $clrPanel
+$script:panCurrentFile.BorderStyle = 'FixedSingle'
+$script:panCurrentFile.Anchor = 'Top,Left,Right'
+$script:form.Controls.Add($script:panCurrentFile)
+
+$script:lblCurrentFileHdr = New-Object System.Windows.Forms.Label
+$script:lblCurrentFileHdr.Text = 'CURRENT FILE'
+$script:lblCurrentFileHdr.Location = [System.Drawing.Point]::new(10, 11)
+$script:lblCurrentFileHdr.AutoSize = $true
+$script:lblCurrentFileHdr.Font = New-Object System.Drawing.Font('Segoe UI', 8, [System.Drawing.FontStyle]::Bold)
+$script:lblCurrentFileHdr.ForeColor = $clrBlue
+$script:panCurrentFile.Controls.Add($script:lblCurrentFileHdr)
+
+$script:lblCurrentFileValue = New-Object System.Windows.Forms.Label
+$script:lblCurrentFileValue.Text = 'Idle'
+$script:lblCurrentFileValue.Location = [System.Drawing.Point]::new(118, 11)
+$script:lblCurrentFileValue.Size = [System.Drawing.Size]::new(806, 18)
+$script:lblCurrentFileValue.ForeColor = $clrText
+$script:lblCurrentFileValue.AutoEllipsis = $true
+$script:panCurrentFile.Controls.Add($script:lblCurrentFileValue)
+
+$script:panProgress = New-Object System.Windows.Forms.Panel
+$script:panProgress.Location = [System.Drawing.Point]::new(10, 492)
+$script:panProgress.Size = [System.Drawing.Size]::new(940, 42)
+$script:panProgress.BackColor = $clrPanel
+$script:panProgress.BorderStyle = 'FixedSingle'
+$script:panProgress.Anchor = 'Top,Left,Right'
+$script:form.Controls.Add($script:panProgress)
+
+$script:lblProgressHdr = New-Object System.Windows.Forms.Label
+$script:lblProgressHdr.Text = 'OVERALL PROGRESS'
+$script:lblProgressHdr.Location = [System.Drawing.Point]::new(10, 11)
+$script:lblProgressHdr.AutoSize = $true
+$script:lblProgressHdr.Font = New-Object System.Drawing.Font('Segoe UI', 8, [System.Drawing.FontStyle]::Bold)
+$script:lblProgressHdr.ForeColor = $clrBlue
+$script:panProgress.Controls.Add($script:lblProgressHdr)
+
+$script:pbOverall = New-Object System.Windows.Forms.ProgressBar
+$script:pbOverall.Location = [System.Drawing.Point]::new(140, 10)
+$script:pbOverall.Size = [System.Drawing.Size]::new(690, 20)
+$script:pbOverall.Minimum = 0
+$script:pbOverall.Maximum = 1000
+$script:pbOverall.Value = 0
+$script:pbOverall.Style = 'Blocks'
+$script:pbOverall.Anchor = 'Top,Left,Right'
+$script:panProgress.Controls.Add($script:pbOverall)
+
+$script:lblProgressValue = New-Object System.Windows.Forms.Label
+$script:lblProgressValue.Text = '0.0%'
+$script:lblProgressValue.Location = [System.Drawing.Point]::new(840, 11)
+$script:lblProgressValue.Size = [System.Drawing.Size]::new(84, 18)
+$script:lblProgressValue.TextAlign = [System.Drawing.ContentAlignment]::MiddleRight
+$script:lblProgressValue.ForeColor = $clrText
+$script:lblProgressValue.Anchor = 'Top,Right'
+$script:panProgress.Controls.Add($script:lblProgressValue)
+
 $lblLogHdr = New-Object System.Windows.Forms.Label
 $lblLogHdr.Text = 'OUTPUT LOG'
-$lblLogHdr.Location = [System.Drawing.Point]::new(10, 444)
+$lblLogHdr.Location = [System.Drawing.Point]::new(10, 542)
 $lblLogHdr.AutoSize = $true
 $lblLogHdr.Font = New-Object System.Drawing.Font('Segoe UI', 8, [System.Drawing.FontStyle]::Bold)
 $lblLogHdr.ForeColor = $clrBlue
 $script:form.Controls.Add($lblLogHdr)
 
-$btnClearLog = New-FlatButton -Text 'Clear' -Parent $script:form -X 896 -Y 440 -W 54 -H 22 -BackColor $clrAlt -ForeColor $clrText
+$btnClearLog = New-FlatButton -Text 'Clear' -Parent $script:form -X 896 -Y 538 -W 54 -H 22 -BackColor $clrAlt -ForeColor $clrText
 $btnClearLog.Anchor = 'Top,Right'
 
 $script:rtLog = New-Object System.Windows.Forms.RichTextBox
-$script:rtLog.Location = [System.Drawing.Point]::new(10, 466)
-$script:rtLog.Size = [System.Drawing.Size]::new(940, 254)
+$script:rtLog.Location = [System.Drawing.Point]::new(10, 564)
+$script:rtLog.Size = [System.Drawing.Size]::new(940, 156)
 $script:rtLog.BackColor = $clrLogBg
 $script:rtLog.ForeColor = [System.Drawing.Color]::FromArgb(180, 230, 180)
 $script:rtLog.Font = New-Object System.Drawing.Font('Consolas', 9)
@@ -430,6 +643,22 @@ $script:statusLabel.ForeColor = [System.Drawing.Color]::White
 $script:statusLabel.Spring = $true
 $script:statusLabel.TextAlign = [System.Drawing.ContentAlignment]::MiddleLeft
 $script:statusBar.Items.Add($script:statusLabel) | Out-Null
+
+$script:statusElapsedLabel = New-Object System.Windows.Forms.ToolStripStatusLabel
+$script:statusElapsedLabel.Text = 'Elapsed: 00:00:00'
+$script:statusElapsedLabel.ForeColor = [System.Drawing.Color]::White
+$script:statusBar.Items.Add($script:statusElapsedLabel) | Out-Null
+
+$script:statusEtaLabel = New-Object System.Windows.Forms.ToolStripStatusLabel
+$script:statusEtaLabel.Text = 'ETA: calculating...'
+$script:statusEtaLabel.ForeColor = [System.Drawing.Color]::White
+$script:statusBar.Items.Add($script:statusEtaLabel) | Out-Null
+
+$script:statusThroughputLabel = New-Object System.Windows.Forms.ToolStripStatusLabel
+$script:statusThroughputLabel.Text = 'Throughput: 0.00 Mbps'
+$script:statusThroughputLabel.ForeColor = [System.Drawing.Color]::White
+$script:statusBar.Items.Add($script:statusThroughputLabel) | Out-Null
+
 $script:form.Controls.Add($script:statusBar)
 
 function Write-Log {
@@ -452,6 +681,159 @@ function Write-Log {
         catch {
         }
     }
+}
+
+function Set-CurrentFileActivity {
+    param(
+        [string]$Text,
+        [System.Drawing.Color]$Color = [System.Drawing.Color]::FromArgb(220, 220, 220)
+    )
+
+    $script:LastFileActivity = $Text
+    $script:lblCurrentFileValue.Text = $Text
+    $script:lblCurrentFileValue.ForeColor = $Color
+}
+
+function Get-CurrentFileActivityFromLine {
+    param([string]$Line)
+
+    if (-not $Line) {
+        return $null
+    }
+
+    $trimmed = $Line.Trim()
+    if (-not $trimmed) {
+        return $null
+    }
+
+    if ($trimmed -match '^(New File|Newer|Older|Same|Tweaked|Extra File|Skipped)\s+(.+)$') {
+        return "{0}: {1}" -f $Matches[1], $Matches[2].Trim()
+    }
+
+    return $null
+}
+
+function Format-DurationText {
+    param([TimeSpan]$Duration)
+
+    if ($Duration.TotalSeconds -lt 0) {
+        $Duration = [TimeSpan]::Zero
+    }
+
+    return '{0:00}:{1:00}:{2:00}' -f [int]$Duration.TotalHours, $Duration.Minutes, $Duration.Seconds
+}
+
+function Get-DirectorySizeBytes {
+    param([string]$Path)
+
+    try {
+        $sum = (Get-ChildItem -LiteralPath $Path -File -Recurse -Force -ErrorAction SilentlyContinue | Measure-Object -Property Length -Sum).Sum
+        if ($null -eq $sum) {
+            return 0L
+        }
+        return [int64]$sum
+    }
+    catch {
+        return 0L
+    }
+}
+
+function Get-RoboCopyProgressRecord {
+    param([string]$Line)
+
+    if (-not $Line) {
+        return $null
+    }
+
+    $trimmed = $Line.Trim()
+    if (-not $trimmed) {
+        return $null
+    }
+
+    if ($trimmed -notmatch '^(?<Status>New File|Newer|Older|Same|Tweaked|Extra File|Skipped)\s+(?<Rest>.+)$') {
+        return $null
+    }
+
+    $status = $Matches['Status']
+    $rest = $Matches['Rest'].Trim()
+    $sizeBytes = 0L
+    $pathText = $rest
+
+    if ($rest -match '^(?<Size>[0-9,]+)\s+(?<Path>.+)$') {
+        $sizeText = ($Matches['Size'] -replace ',', '')
+        if ([int64]::TryParse($sizeText, [ref]$sizeBytes)) {
+            $pathText = $Matches['Path'].Trim()
+        }
+        else {
+            $sizeBytes = 0L
+        }
+    }
+
+    return [PSCustomObject]@{
+        Status = $status
+        Path = $pathText
+        SizeBytes = $sizeBytes
+        CountsAsProcessed = ($status -in @('New File', 'Newer', 'Older', 'Same', 'Tweaked', 'Skipped'))
+        CountsAsCopied = ($status -in @('New File', 'Newer', 'Older', 'Tweaked'))
+    }
+}
+
+function Reset-CopyMetrics {
+    $script:CopyStartTime = $null
+    $script:SourceTotalBytes = 0L
+    $script:ProcessedBytes = 0L
+    $script:CopiedBytes = 0L
+    $script:statusElapsedLabel.Text = 'Elapsed: 00:00:00'
+    $script:statusEtaLabel.Text = 'ETA: calculating...'
+    $script:statusThroughputLabel.Text = 'Throughput: 0.00 Mbps'
+    $script:pbOverall.Style = 'Blocks'
+    $script:pbOverall.Value = 0
+    $script:lblProgressValue.Text = '0.0%'
+}
+
+function Update-CopyMetrics {
+    if (-not $script:CopyStartTime) {
+        Reset-CopyMetrics
+        return
+    }
+
+    $elapsed = (Get-Date) - $script:CopyStartTime
+    if ($elapsed.TotalSeconds -lt 0.01) {
+        $elapsed = [TimeSpan]::FromSeconds(0.01)
+    }
+
+    $script:statusElapsedLabel.Text = 'Elapsed: {0}' -f (Format-DurationText -Duration $elapsed)
+
+    $mbps = 0.0
+    if ($script:CopiedBytes -gt 0) {
+        $mbps = ($script:CopiedBytes * 8.0) / 1000000.0 / $elapsed.TotalSeconds
+    }
+    $script:statusThroughputLabel.Text = 'Throughput: {0:N2} Mbps' -f $mbps
+
+    if ($script:SourceTotalBytes -gt 0 -and $script:ProcessedBytes -gt 0) {
+        $ratio = [Math]::Min(1.0, ($script:ProcessedBytes / [double]$script:SourceTotalBytes))
+        $script:pbOverall.Style = 'Blocks'
+        $script:pbOverall.Value = [Math]::Min($script:pbOverall.Maximum, [Math]::Max(0, [int]([Math]::Round($ratio * $script:pbOverall.Maximum))))
+        $script:lblProgressValue.Text = '{0:N1}%' -f ($ratio * 100.0)
+        if ($ratio -gt 0) {
+            $remainingSeconds = [Math]::Max(0.0, ($elapsed.TotalSeconds / $ratio) - $elapsed.TotalSeconds)
+            $eta = (Get-Date).AddSeconds($remainingSeconds)
+            $script:statusEtaLabel.Text = 'ETA: {0}' -f $eta.ToString('HH:mm:ss')
+            return
+        }
+    }
+
+    if ($script:SourceTotalBytes -gt 0) {
+        $script:pbOverall.Style = 'Blocks'
+        $script:pbOverall.Value = 0
+        $script:lblProgressValue.Text = '0.0%'
+    }
+    else {
+        $script:pbOverall.Style = 'Marquee'
+        $script:lblProgressValue.Text = 'Scanning...'
+    }
+
+    $script:statusEtaLabel.Text = 'ETA: calculating...'
 }
 
 function Get-SelectedFlags {
@@ -561,7 +943,7 @@ function Refresh-JobButtons {
 
     foreach ($job in $jobs) {
         $btnJob = New-Object System.Windows.Forms.Button
-        $btnJob.Text = $job.Name
+        $btnJob.Text = [string]$job.Name
         $btnJob.Size = [System.Drawing.Size]::new(178, 56)
         $btnJob.FlatStyle = 'Flat'
         $btnJob.BackColor = $clrJobBtn
@@ -689,6 +1071,14 @@ function Start-RoboCopyJob {
         return
     }
 
+    try {
+
+    $effectiveFlags = Normalize-FlagString -Flags $Flags
+    $effectiveFlags = Resolve-RoboCopyPermissionFlags -Flags $effectiveFlags
+    if ($null -eq $effectiveFlags) {
+        return
+    }
+
     if ($script:RoboProcess -and -not $script:RoboProcess.HasExited) {
         $script:RoboProcess.Kill()
     }
@@ -697,117 +1087,180 @@ function Start-RoboCopyJob {
     }
 
     Start-RunLog
+    Reset-RawOutputTracking
+
+    $script:CopyStartTime = Get-Date
+    $script:SourceTotalBytes = Get-DirectorySizeBytes -Path $Src
+    $script:ProcessedBytes = 0L
+    $script:CopiedBytes = 0L
+    Update-CopyMetrics
 
     $script:btnRun.Enabled = $false
     $script:btnStop.Enabled = $true
     $script:statusLabel.Text = 'Running...'
     $script:statusBar.BackColor = $clrOrange
+    Set-CurrentFileActivity -Text 'Starting RoboCopy...' -Color ([System.Drawing.Color]::FromArgb(120, 180, 255))
 
-    $cmdArgs = "`"$Src`" `"$Dst`" $Flags"
+    $cmdArgs = "`"$Src`" `"$Dst`" $effectiveFlags"
+    $rawStamp = Get-Date -Format 'yyyyMMdd_HHmmss'
+    $rawDir = if ($env:TEMP -and (Test-Path -LiteralPath $env:TEMP)) {
+        $env:TEMP
+    }
+    else {
+        $script:BasePath
+    }
+    $script:RawOutputPath = Join-Path $rawDir ("RoboVMCopy_raw_{0}.log" -f $rawStamp)
+    if (Test-Path -LiteralPath $script:RawOutputPath) {
+        Remove-Item -LiteralPath $script:RawOutputPath -Force -ErrorAction SilentlyContinue
+    }
     Write-Log ('-' * 90) ([System.Drawing.Color]::FromArgb(55, 55, 70))
     Write-Log "robocopy $cmdArgs" ([System.Drawing.Color]::FromArgb(120, 180, 255))
     Write-Log "Run log file: $($script:RunLogPath)" ([System.Drawing.Color]::FromArgb(120, 180, 255))
+    Write-Log "Raw output capture: $($script:RawOutputPath)" ([System.Drawing.Color]::FromArgb(120, 180, 255))
 
     $script:OutputQueue = [System.Collections.Concurrent.ConcurrentQueue[string]]::new()
 
     $psi = New-Object System.Diagnostics.ProcessStartInfo
-    $psi.FileName = 'robocopy.exe'
-    $psi.Arguments = $cmdArgs
+    $psi.FileName = 'cmd.exe'
+    $psi.Arguments = "/d /c robocopy $cmdArgs 1> `"$($script:RawOutputPath)`" 2>&1"
     $psi.UseShellExecute = $false
-    $psi.RedirectStandardOutput = $true
-    $psi.RedirectStandardError = $true
     $psi.CreateNoWindow = $true
 
     $script:RoboProcess = New-Object System.Diagnostics.Process
     $script:RoboProcess.StartInfo = $psi
     $script:RoboProcess.EnableRaisingEvents = $true
 
-    $script:RoboProcess.add_OutputDataReceived({
-        param($proc, $data)
-        if ($null -ne $data.Data) {
-            $script:OutputQueue.Enqueue($data.Data)
-        }
-    })
-
-    $script:RoboProcess.add_ErrorDataReceived({
-        param($proc, $data)
-        if ($null -ne $data.Data -and $data.Data.Trim()) {
-            $script:OutputQueue.Enqueue("STDERR: $($data.Data)")
-        }
-    })
-
     $script:RoboProcess.Start() | Out-Null
-    $script:RoboProcess.BeginOutputReadLine()
-    $script:RoboProcess.BeginErrorReadLine()
 
     $script:PollTimer = New-Object System.Windows.Forms.Timer
     $script:PollTimer.Interval = 120
 
     $script:PollTimer.add_Tick({
-        $line = ''
-        while ($script:OutputQueue.TryDequeue([ref]$line)) {
-            $color = if ($line -match 'ERROR|error|STDERR:') {
-                [System.Drawing.Color]::FromArgb(255, 100, 100)
-            }
-            elseif ($line -match 'New File|Newer|Extra File|Extra Dir') {
-                [System.Drawing.Color]::FromArgb(100, 220, 120)
-            }
-            elseif ($line -match 'Skipped|Same|Tweaked') {
-                [System.Drawing.Color]::FromArgb(130, 130, 145)
-            }
-            else {
-                [System.Drawing.Color]::FromArgb(180, 230, 180)
-            }
-            Write-Log $line $color
-        }
-
-        if ($script:RoboProcess.HasExited -and $script:OutputQueue.IsEmpty) {
-            $script:PollTimer.Stop()
-
-            if ($script:RunLogWriter) {
-                Close-RunLog
-                if ($script:RunLogPath) {
-                    Write-Log "Saved run log to: $($script:RunLogPath)" ([System.Drawing.Color]::FromArgb(120, 180, 255))
-                }
-            }
-
-            if (-not $script:btnRun.Enabled) {
-                $exit = $script:RoboProcess.ExitCode
-                Write-Log ('-' * 90) ([System.Drawing.Color]::FromArgb(55, 55, 70))
-
-                if ($exit -lt 8) {
-                    $desc = switch ($exit) {
-                        0 { 'No files copied. Source and destination are already in sync.' }
-                        1 { 'Files copied successfully.' }
-                        2 { 'Extra files detected at destination (no copy errors).' }
-                        3 { 'Files copied and extra files detected at destination.' }
-                        default { 'Completed with informational status flags.' }
+        try {
+            foreach ($line in @(Get-NewRawOutputLines)) {
+                $progressRecord = Get-RoboCopyProgressRecord -Line $line
+                if ($progressRecord) {
+                    if ($progressRecord.CountsAsProcessed -and $progressRecord.SizeBytes -gt 0) {
+                        $script:ProcessedBytes += $progressRecord.SizeBytes
                     }
-                    Write-Log "Completed. Exit code $exit - $desc" ([System.Drawing.Color]::FromArgb(80, 210, 120))
-                    $script:statusLabel.Text = "Completed (exit $exit)"
-                    $script:statusBar.BackColor = [System.Drawing.Color]::FromArgb(25, 115, 55)
-                }
-                else {
-                    Write-Log "Errors detected. Exit code $exit." ([System.Drawing.Color]::FromArgb(255, 100, 100))
-                    $script:statusLabel.Text = "Errors (exit $exit)"
-                    $script:statusBar.BackColor = $clrRed
+                    if ($progressRecord.CountsAsCopied -and $progressRecord.SizeBytes -gt 0) {
+                        $script:CopiedBytes += $progressRecord.SizeBytes
+                    }
                 }
 
-                if ($script:cbKeepOpen.Checked) {
-                    Write-Log 'Copy finished. Application remains open.' ([System.Drawing.Color]::FromArgb(120, 180, 255))
-                }
-                else {
-                    Write-Log 'Copy finished. Closing application by user preference.' ([System.Drawing.Color]::FromArgb(255, 165, 0))
-                    $script:form.Close()
+                $currentFile = Get-CurrentFileActivityFromLine -Line $line
+                if ($currentFile) {
+                    Set-CurrentFileActivity -Text $currentFile -Color $clrText
                 }
 
-                $script:btnRun.Enabled = $true
-                $script:btnStop.Enabled = $false
+                $color = if ($line -match 'ERROR|error|STDERR:') {
+                    [System.Drawing.Color]::FromArgb(255, 100, 100)
+                }
+                elseif ($line -match 'New File|Newer|Extra File|Extra Dir') {
+                    [System.Drawing.Color]::FromArgb(100, 220, 120)
+                }
+                elseif ($line -match 'Skipped|Same|Tweaked') {
+                    [System.Drawing.Color]::FromArgb(130, 130, 145)
+                }
+                else {
+                    [System.Drawing.Color]::FromArgb(180, 230, 180)
+                }
+                Write-Log $line $color
             }
+
+            Update-CopyMetrics
+
+            if ($script:RoboProcess.HasExited -and @(Get-NewRawOutputLines).Count -eq 0) {
+                $script:PollTimer.Stop()
+                $rawPathAtEnd = $script:RawOutputPath
+                $rawLineCountAtEnd = $script:RawOutputLineCount
+                Reset-RawOutputTracking
+
+                if ($rawPathAtEnd) {
+                    if (Test-Path -LiteralPath $rawPathAtEnd) {
+                        Write-Log "Raw output complete: $rawPathAtEnd (lines: $rawLineCountAtEnd)" ([System.Drawing.Color]::FromArgb(120, 180, 255))
+                    }
+                    else {
+                        Write-Log "Raw output file missing: $rawPathAtEnd" ([System.Drawing.Color]::FromArgb(255, 165, 0))
+                    }
+                }
+
+                if ($script:RunLogWriter) {
+                    Close-RunLog
+                    if ($script:RunLogPath) {
+                        Write-Log "Saved run log to: $($script:RunLogPath)" ([System.Drawing.Color]::FromArgb(120, 180, 255))
+                    }
+                }
+
+                if (-not $script:btnRun.Enabled) {
+                    $exit = $script:RoboProcess.ExitCode
+                    Write-Log ('-' * 90) ([System.Drawing.Color]::FromArgb(55, 55, 70))
+
+                    if ($exit -lt 8) {
+                        $desc = switch ($exit) {
+                            0 { 'No files copied. Source and destination are already in sync.' }
+                            1 { 'Files copied successfully.' }
+                            2 { 'Extra files detected at destination (no copy errors).' }
+                            3 { 'Files copied and extra files detected at destination.' }
+                            default { 'Completed with informational status flags.' }
+                        }
+                        Write-Log "Completed. Exit code $exit - $desc" ([System.Drawing.Color]::FromArgb(80, 210, 120))
+                        $script:statusLabel.Text = "Completed (exit $exit)"
+                        $script:statusBar.BackColor = [System.Drawing.Color]::FromArgb(25, 115, 55)
+                    }
+                    else {
+                        Write-Log "Errors detected. Exit code $exit." ([System.Drawing.Color]::FromArgb(255, 100, 100))
+                        $script:statusLabel.Text = "Errors (exit $exit)"
+                        $script:statusBar.BackColor = $clrRed
+                    }
+
+                    Write-Log 'Copy finished. Application remains open.' ([System.Drawing.Color]::FromArgb(120, 180, 255))
+                    Set-CurrentFileActivity -Text 'Idle' -Color $clrText
+                    if ($script:SourceTotalBytes -gt 0) {
+                        $script:ProcessedBytes = [Math]::Max($script:ProcessedBytes, $script:SourceTotalBytes)
+                    }
+                    Update-CopyMetrics
+
+                    $script:btnRun.Enabled = $true
+                    $script:btnStop.Enabled = $false
+                }
+            }
+        }
+        catch {
+            Write-CrashLog ("Timer runtime error: {0}" -f $_.Exception.ToString())
+            $script:statusLabel.Text = 'Runtime error (see log)'
+            $script:statusBar.BackColor = $clrRed
+            $script:btnRun.Enabled = $true
+            $script:btnStop.Enabled = $false
+            Write-Log ("Runtime error: {0}" -f $_.Exception.Message) ([System.Drawing.Color]::FromArgb(255, 100, 100))
+            [System.Windows.Forms.MessageBox]::Show(
+                "A runtime error occurred while updating copy output:`r`n`r`n$($_.Exception.Message)",
+                'RoboVMCopy Error',
+                [System.Windows.Forms.MessageBoxButtons]::OK,
+                [System.Windows.Forms.MessageBoxIcon]::Error
+            ) | Out-Null
         }
     })
 
     $script:PollTimer.Start()
+    }
+    catch {
+        Write-CrashLog ("Copy startup failed: {0}" -f $_.Exception.ToString())
+        $script:statusLabel.Text = 'Startup error (see log)'
+        $script:statusBar.BackColor = $clrRed
+        $script:btnRun.Enabled = $true
+        $script:btnStop.Enabled = $false
+        Set-CurrentFileActivity -Text 'Idle' -Color $clrText
+
+        Write-Log ("Copy startup failed: {0}" -f $_.Exception.Message) ([System.Drawing.Color]::FromArgb(255, 100, 100))
+
+        [System.Windows.Forms.MessageBox]::Show(
+            "Failed to start RoboCopy job:`r`n`r`n$($_.Exception.Message)",
+            'RoboVMCopy Error',
+            [System.Windows.Forms.MessageBoxButtons]::OK,
+            [System.Windows.Forms.MessageBoxIcon]::Error
+        ) | Out-Null
+    }
 }
 
 # Browse source
@@ -831,6 +1284,20 @@ $script:btnRun.Add_Click({
     Start-RoboCopyJob -Src $script:tbSource.Text.Trim() -Dst $script:tbDest.Text.Trim() -Flags (Get-SelectedFlags)
 })
 
+$script:btnExit.Add_Click({
+    $ans = [System.Windows.Forms.MessageBox]::Show(
+        'Exit RoboVMCopy?',
+        'Confirm Exit',
+        [System.Windows.Forms.MessageBoxButtons]::YesNo,
+        [System.Windows.Forms.MessageBoxIcon]::Question
+    )
+
+    if ($ans -eq [System.Windows.Forms.DialogResult]::Yes) {
+        $script:AllowClose = $true
+        $script:form.Close()
+    }
+})
+
 # Stop
 $script:btnStop.Add_Click({
     if ($script:RoboProcess -and -not $script:RoboProcess.HasExited) {
@@ -838,6 +1305,9 @@ $script:btnStop.Add_Click({
         Write-Log 'Stopped by user.' ([System.Drawing.Color]::FromArgb(255, 165, 0))
         $script:statusLabel.Text = 'Stopped by user'
         $script:statusBar.BackColor = [System.Drawing.Color]::FromArgb(110, 55, 0)
+        Set-CurrentFileActivity -Text 'Stopped' -Color ([System.Drawing.Color]::FromArgb(255, 165, 0))
+        Reset-CopyMetrics
+        Reset-RawOutputTracking
         $script:btnRun.Enabled = $true
         $script:btnStop.Enabled = $false
     }
@@ -889,7 +1359,7 @@ $btnSaveJob.Add_Click({
         Name = $name
         Source = $src
         Destination = $dst
-        Flags = (Get-SelectedFlags)
+        Flags = (Normalize-FlagString -Flags (Get-SelectedFlags))
     }
 
     Save-AllJobs -Jobs $jobs
@@ -903,12 +1373,22 @@ $btnClearLog.Add_Click({
 })
 
 $script:form.Add_FormClosing({
+    param($sender, $e)
+
+    if (-not $script:AllowClose) {
+        $e.Cancel = $true
+        $script:statusLabel.Text = 'Use the Exit button to close RoboVMCopy.'
+        Write-Log 'Close request ignored. Click Exit to close the application.' ([System.Drawing.Color]::FromArgb(255, 165, 0))
+        return
+    }
+
     if ($script:RoboProcess -and -not $script:RoboProcess.HasExited) {
         $script:RoboProcess.Kill()
     }
     if ($script:PollTimer) {
         $script:PollTimer.Stop()
     }
+    Reset-RawOutputTracking
     Close-RunLog
 })
 
@@ -918,7 +1398,10 @@ Write-Log '2. Pick your RoboCopy options.' $clrMuted
 Write-Log '3. Click Run RoboCopy, or save as a quick-launch job button.' $clrMuted
 Write-Log '4. Left click a saved button to run it.' $clrMuted
 Write-Log '5. Right click a saved button for load/edit/run/delete options.' $clrMuted
-Write-Log '6. Every run is saved to Logs/RoboCopy_yyyyMMdd_HHmmss.log.' $clrMuted
+Write-Log '6. Every run is saved beside the script as RoboCopy_yyyyMMdd_HHmmss.log.' $clrMuted
+Write-Log '7. Per-file RoboCopy output is always shown in the GUI.' $clrMuted
+Set-CurrentFileActivity -Text 'Idle' -Color $clrText
+Reset-CopyMetrics
 Write-Log '' $clrMuted
 
 Refresh-JobButtons
