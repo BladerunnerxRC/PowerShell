@@ -2,3 +2,10 @@
 - [x] Show robocopy output and save a log with date and time appended to filename
 - [x] Stop the application from exiting after copy
 - [x] Find a way to show mapped drives on local PC when browsing
+- Gui exits after starting copy from saved copy process
+    - I should only exit the gui when I click exit.
+        - when clicking exit it should prompt if I really want to exit.
+- The hard copy of the log should be saved in the same folder as this powerscript executable
+- an extra blank saved copy process button is created when I save one
+- I want to file copying process in the gui for each file.. just like is seen in cli when runniong robocopy
+
