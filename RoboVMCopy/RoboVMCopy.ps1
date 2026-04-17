@@ -46,9 +46,23 @@ $script:CopyStartTime = $null
 $script:SourceTotalBytes = 0L
 $script:ProcessedBytes = 0L
 $script:CopiedBytes = 0L
+$script:LastMetricsUpdate = $null
+$script:LastCopiedBytesSample = 0L
+$script:SmoothedMbps = 0.0
+$script:SmoothedBpsForEta = 0.0
+$script:LastEtaUpdate = $null
 $script:RawOutputPath = $null
 $script:RawOutputLineCount = 0
 $script:CrashLogPath = Join-Path $script:BasePath 'RoboVMCopy_Crash.log'
+$script:LogExpandedHeight = 156
+$script:LogCollapsedHeight = 28
+$script:AutoCollapseAt = $null
+$script:SummarySkipped = [System.Collections.Generic.HashSet[string]]::new()
+$script:SummaryMismatch = [System.Collections.Generic.HashSet[string]]::new()
+$script:SummaryFailed = [System.Collections.Generic.HashSet[string]]::new()
+$script:SummaryExtras = [System.Collections.Generic.HashSet[string]]::new()
+$script:LastTimesRow = $null
+$script:HasShownRuntimeErrorDialog = $false
 
 function Write-CrashLog {
     param([string]$Message)
@@ -96,15 +110,48 @@ function Close-RunLog {
 function Start-RunLog {
     Close-RunLog
 
+    $script:RunLogPath = $null
+    $script:RunLogWriter = $null
+
+    $stamp = Get-Date -Format 'yyyyMMdd_HHmmss'
+    $primaryError = $null
     try {
-        $stamp = Get-Date -Format 'yyyyMMdd_HHmmss'
-        $script:RunLogPath = Join-Path $script:BasePath ("RoboCopy_{0}.log" -f $stamp)
+        $logDir = Join-Path $script:BasePath 'Logs'
+        if (-not (Test-Path -LiteralPath $logDir)) {
+            New-Item -Path $logDir -ItemType Directory -Force | Out-Null
+        }
+
+        $script:RunLogPath = Join-Path $logDir ("RoboCopy_{0}.log" -f $stamp)
         $script:RunLogWriter = New-Object System.IO.StreamWriter($script:RunLogPath, $false, [System.Text.Encoding]::UTF8)
         $script:RunLogWriter.AutoFlush = $true
     }
     catch {
-        $script:RunLogPath = $null
-        $script:RunLogWriter = $null
+        $primaryError = $_.Exception.Message
+    }
+
+    if (-not $script:RunLogWriter) {
+        try {
+            $fallbackRoot = if ($env:TEMP -and (Test-Path -LiteralPath $env:TEMP)) {
+                $env:TEMP
+            }
+            else {
+                $script:BasePath
+            }
+
+            $fallbackDir = Join-Path $fallbackRoot 'RoboVMCopyLogs'
+            if (-not (Test-Path -LiteralPath $fallbackDir)) {
+                New-Item -Path $fallbackDir -ItemType Directory -Force | Out-Null
+            }
+
+            $script:RunLogPath = Join-Path $fallbackDir ("RoboCopy_{0}.log" -f $stamp)
+            $script:RunLogWriter = New-Object System.IO.StreamWriter($script:RunLogPath, $false, [System.Text.Encoding]::UTF8)
+            $script:RunLogWriter.AutoFlush = $true
+        }
+        catch {
+            $script:RunLogPath = $null
+            $script:RunLogWriter = $null
+            Write-CrashLog ("Run log initialization failed. Primary error: {0}. Fallback error: {1}" -f $primaryError, $_.Exception.Message)
+        }
     }
 }
 
@@ -412,6 +459,11 @@ $flagDefs = @(
 )
 
 $script:checkboxes = @{}
+$script:optionTooltips = New-Object System.Windows.Forms.ToolTip
+$script:optionTooltips.AutoPopDelay = 12000
+$script:optionTooltips.InitialDelay = 250
+$script:optionTooltips.ReshowDelay = 150
+$script:optionTooltips.ShowAlways = $true
 $colW = 228
 $col = 0
 $row = 0
@@ -424,6 +476,7 @@ foreach ($fd in $flagDefs) {
     $cb.ForeColor = $clrText
     $cb.Cursor = [System.Windows.Forms.Cursors]::Hand
     $panOpts.Controls.Add($cb)
+    $script:optionTooltips.SetToolTip($cb, $fd.D)
     $script:checkboxes[$fd.F] = $cb
     $col++
     if ($col -ge 4) {
@@ -469,6 +522,9 @@ $nudY = 84
 $script:nudMT = Add-Spinner -Label '/MT (threads):' -X 10 -Min 1 -Max 128 -Default 8 -Parent $panOpts -Y $nudY -LabelColor $clrText -InputBack $clrInput -InputFore $clrText
 $script:nudR  = Add-Spinner -Label '/R (retries):' -X 175 -Min 0 -Max 99 -Default 3 -Parent $panOpts -Y $nudY -LabelColor $clrText -InputBack $clrInput -InputFore $clrText
 $script:nudW  = Add-Spinner -Label '/W (wait sec):' -X 340 -Min 0 -Max 300 -Default 5 -Parent $panOpts -Y $nudY -LabelColor $clrText -InputBack $clrInput -InputFore $clrText
+$script:optionTooltips.SetToolTip($script:nudMT, 'Thread count for multi-threaded copies. Higher can improve speed on fast storage/network.')
+$script:optionTooltips.SetToolTip($script:nudR, 'Retry attempts for failed file copies.')
+$script:optionTooltips.SetToolTip($script:nudW, 'Seconds to wait between retries.')
 
 $lblExtra = New-Object System.Windows.Forms.Label
 $lblExtra.Text = 'Extra flags:'
@@ -485,6 +541,7 @@ $script:tbExtra.ForeColor = $clrText
 $script:tbExtra.BorderStyle = 'FixedSingle'
 $script:tbExtra.Anchor = 'Top,Left,Right'
 $panOpts.Controls.Add($script:tbExtra)
+$script:optionTooltips.SetToolTip($script:tbExtra, 'Optional extra robocopy flags, for example: /FFT /XO /XD "Temp"')
 
 # Action panel
 $panAction = New-Object System.Windows.Forms.Panel
@@ -513,22 +570,22 @@ $panAction.Controls.Add($lblSaveAs)
 
 $script:tbJobName = New-Object System.Windows.Forms.TextBox
 $script:tbJobName.Location = [System.Drawing.Point]::new(383, 9)
-$script:tbJobName.Size = [System.Drawing.Size]::new(374, 24)
+$script:tbJobName.Size = [System.Drawing.Size]::new(208, 24)
 $script:tbJobName.BackColor = $clrInput
 $script:tbJobName.ForeColor = $clrText
 $script:tbJobName.BorderStyle = 'FixedSingle'
-$script:tbJobName.Anchor = 'Top,Left,Right'
+$script:tbJobName.Anchor = 'Top,Left'
 $panAction.Controls.Add($script:tbJobName)
 
 $lblExitHint = New-Object System.Windows.Forms.Label
-$lblExitHint.Text = 'The app stays open until you click Exit.'
+$lblExitHint.Text = ''
 $lblExitHint.Location = [System.Drawing.Point]::new(274, 38)
 $lblExitHint.Size = [System.Drawing.Size]::new(250, 18)
 $lblExitHint.ForeColor = $clrMuted
 $panAction.Controls.Add($lblExitHint)
 
-$btnSaveJob = New-FlatButton -Text 'Save Job' -Parent $panAction -X 678 -Y 5 -W 160 -H 34 -BackColor $clrBlue -ForeColor ([System.Drawing.Color]::White)
-$btnSaveJob.Anchor = 'Top,Right'
+$btnSaveJob = New-FlatButton -Text 'Save Job' -Parent $panAction -X 600 -Y 5 -W 130 -H 34 -BackColor $clrBlue -ForeColor ([System.Drawing.Color]::White)
+$btnSaveJob.Anchor = 'Top,Left'
 
 # Jobs panel
 $lblJobsHdr = New-Object System.Windows.Forms.Label
@@ -618,8 +675,11 @@ $lblLogHdr.Font = New-Object System.Drawing.Font('Segoe UI', 8, [System.Drawing.
 $lblLogHdr.ForeColor = $clrBlue
 $script:form.Controls.Add($lblLogHdr)
 
-$btnClearLog = New-FlatButton -Text 'Clear' -Parent $script:form -X 896 -Y 538 -W 54 -H 22 -BackColor $clrAlt -ForeColor $clrText
-$btnClearLog.Anchor = 'Top,Right'
+$script:btnClearLog = New-FlatButton -Text 'Clear' -Parent $script:form -X 896 -Y 538 -W 54 -H 22 -BackColor $clrAlt -ForeColor $clrText
+$script:btnClearLog.Anchor = 'Top,Right'
+
+$script:btnToggleLog = New-FlatButton -Text 'Collapse' -Parent $script:form -X 816 -Y 538 -W 76 -H 22 -BackColor $clrAlt -ForeColor $clrText
+$script:btnToggleLog.Anchor = 'Top,Right'
 
 $script:rtLog = New-Object System.Windows.Forms.RichTextBox
 $script:rtLog.Location = [System.Drawing.Point]::new(10, 564)
@@ -655,7 +715,7 @@ $script:statusEtaLabel.ForeColor = [System.Drawing.Color]::White
 $script:statusBar.Items.Add($script:statusEtaLabel) | Out-Null
 
 $script:statusThroughputLabel = New-Object System.Windows.Forms.ToolStripStatusLabel
-$script:statusThroughputLabel.Text = 'Throughput: 0.00 Mbps'
+$script:statusThroughputLabel.Text = 'Throughput: 0.0 Mbps'
 $script:statusThroughputLabel.ForeColor = [System.Drawing.Color]::White
 $script:statusBar.Items.Add($script:statusThroughputLabel) | Out-Null
 
@@ -683,6 +743,27 @@ function Write-Log {
     }
 }
 
+function Set-OutputLogCollapsed {
+    param([bool]$Collapsed)
+
+    $script:LogIsCollapsed = $Collapsed
+    if ($script:rtLog) {
+        $script:rtLog.Height = if ($Collapsed) { $script:LogCollapsedHeight } else { $script:LogExpandedHeight }
+    }
+    if ($script:btnClearLog) {
+        $script:btnClearLog.Visible = -not $Collapsed
+    }
+    if ($script:btnToggleLog) {
+        $script:btnToggleLog.Text = if ($Collapsed) { 'Expand' } else { 'Collapse' }
+    }
+}
+
+function Queue-OutputLogAutoCollapse {
+    param([int]$Seconds = 10)
+
+    $script:AutoCollapseAt = (Get-Date).AddSeconds([Math]::Max(0, $Seconds))
+}
+
 function Set-CurrentFileActivity {
     param(
         [string]$Text,
@@ -706,7 +787,7 @@ function Get-CurrentFileActivityFromLine {
         return $null
     }
 
-    if ($trimmed -match '^(New File|Newer|Older|Same|Tweaked|Extra File|Skipped)\s+(.+)$') {
+    if ($trimmed -match '^(New File|Newer|Older|Same|Tweaked|Extra File|Extra Dir|Skipped|Mismatched|\*MISMATCH|\*EXTRA File|\*EXTRA Dir)\s+(.+)$') {
         return "{0}: {1}" -f $Matches[1], $Matches[2].Trim()
     }
 
@@ -738,6 +819,113 @@ function Get-DirectorySizeBytes {
     }
 }
 
+function Convert-RoboSizeToBytes {
+    param([string]$Token)
+
+    if (-not $Token) {
+        return 0L
+    }
+
+    $normalized = ($Token.Trim() -replace ',', '')
+    $bytes = 0L
+
+    if ($normalized -match '^(?<Value>\d+(?:\.\d+)?)(?<Unit>[kmgte]?)(?:b)?$') {
+        $value = [double]$Matches['Value']
+        $unit = $Matches['Unit'].ToLowerInvariant()
+        $factor = switch ($unit) {
+            'k' { 1024.0 }
+            'm' { 1024.0 * 1024.0 }
+            'g' { 1024.0 * 1024.0 * 1024.0 }
+            't' { 1024.0 * 1024.0 * 1024.0 * 1024.0 }
+            'e' { 1024.0 * 1024.0 * 1024.0 * 1024.0 * 1024.0 }
+            default { 1.0 }
+        }
+
+        $bytes = [int64][Math]::Round($value * $factor)
+        return [Math]::Max(0L, $bytes)
+    }
+
+    return 0L
+}
+
+function Add-SummaryPath {
+    param(
+        [System.Collections.Generic.HashSet[string]]$Set,
+        [string]$Path
+    )
+
+    if ($Set -and -not [string]::IsNullOrWhiteSpace($Path)) {
+        [void]$Set.Add($Path.Trim())
+    }
+}
+
+function Track-ResultLine {
+    param([string]$Line)
+
+    if (-not $Line) {
+        return
+    }
+
+    $trimmed = $Line.Trim()
+    if (-not $trimmed) {
+        return
+    }
+
+    if ($trimmed -match '^(?:\*?EXTRA\s+(?:Dir|File)|Extra\s+(?:Dir|File))\s+(?<Path>.+)$') {
+        Add-SummaryPath -Set $script:SummaryExtras -Path $Matches['Path']
+        return
+    }
+
+    if ($trimmed -match '^(?:\*?MISMATCH|Mismatched)\s+(?<Path>.+)$') {
+        Add-SummaryPath -Set $script:SummaryMismatch -Path $Matches['Path']
+        return
+    }
+
+    if ($trimmed -match '^(?:\*?FAILED|ERROR\s+\d+)\s+(?<Path>.+)$') {
+        Add-SummaryPath -Set $script:SummaryFailed -Path $Matches['Path']
+        return
+    }
+
+    if ($trimmed -match '^\s*Times\s*:\s+(?<Rest>.+)$') {
+        $script:LastTimesRow = $Matches['Rest'].Trim()
+    }
+}
+
+function Write-DetailedSummary {
+    if ($script:SummarySkipped.Count -gt 0) {
+        Write-Log ("Skipped files ({0}):" -f $script:SummarySkipped.Count) ([System.Drawing.Color]::FromArgb(255, 215, 128))
+        foreach ($p in ($script:SummarySkipped | Sort-Object)) {
+            Write-Log ("  - {0}" -f $p) $clrMuted
+        }
+    }
+
+    if ($script:SummaryMismatch.Count -gt 0) {
+        Write-Log ("Mismatched files ({0}):" -f $script:SummaryMismatch.Count) ([System.Drawing.Color]::FromArgb(255, 200, 120))
+        foreach ($p in ($script:SummaryMismatch | Sort-Object)) {
+            Write-Log ("  - {0}" -f $p) $clrMuted
+        }
+    }
+
+    if ($script:SummaryFailed.Count -gt 0) {
+        Write-Log ("Failed files ({0}):" -f $script:SummaryFailed.Count) ([System.Drawing.Color]::FromArgb(255, 128, 128))
+        foreach ($p in ($script:SummaryFailed | Sort-Object)) {
+            Write-Log ("  - {0}" -f $p) $clrMuted
+        }
+    }
+
+    if ($script:SummaryExtras.Count -gt 0) {
+        Write-Log ("Extra files/dirs ({0}):" -f $script:SummaryExtras.Count) ([System.Drawing.Color]::FromArgb(180, 210, 255))
+        foreach ($p in ($script:SummaryExtras | Sort-Object)) {
+            Write-Log ("  - {0}" -f $p) $clrMuted
+        }
+    }
+
+    if ($script:LastTimesRow) {
+        Write-Log ('Times row raw values: {0}' -f $script:LastTimesRow) ([System.Drawing.Color]::FromArgb(120, 180, 255))
+        Write-Log 'Times columns are: Total = full run time, Copied = transfer time, Skipped = scan/compare time, Mismatch = time validating mismatched items, FAILED = time spent before file failures, Extras = time spent processing extras.' $clrMuted
+    }
+}
+
 function Get-RoboCopyProgressRecord {
     param([string]$Line)
 
@@ -750,7 +938,7 @@ function Get-RoboCopyProgressRecord {
         return $null
     }
 
-    if ($trimmed -notmatch '^(?<Status>New File|Newer|Older|Same|Tweaked|Extra File|Skipped)\s+(?<Rest>.+)$') {
+    if ($trimmed -notmatch '^(?<Status>New File|Newer|Older|Same|Tweaked|Extra File|Extra Dir|Skipped|\*EXTRA File|\*EXTRA Dir|Mismatched|\*MISMATCH)\s+(?<Rest>.+)$') {
         return $null
     }
 
@@ -759,21 +947,28 @@ function Get-RoboCopyProgressRecord {
     $sizeBytes = 0L
     $pathText = $rest
 
-    if ($rest -match '^(?<Size>[0-9,]+)\s+(?<Path>.+)$') {
-        $sizeText = ($Matches['Size'] -replace ',', '')
-        if ([int64]::TryParse($sizeText, [ref]$sizeBytes)) {
+    if ($rest -match '^(?<Size>[0-9][0-9,\.]*\s*[kmgte]?b?)\s+(?<Path>.+)$') {
+        $sizeBytes = Convert-RoboSizeToBytes -Token $Matches['Size']
+        if ($sizeBytes -ge 0) {
             $pathText = $Matches['Path'].Trim()
         }
-        else {
-            $sizeBytes = 0L
-        }
+    }
+
+    if ($status -in @('Skipped')) {
+        Add-SummaryPath -Set $script:SummarySkipped -Path $pathText
+    }
+    elseif ($status -in @('Mismatched', '*MISMATCH')) {
+        Add-SummaryPath -Set $script:SummaryMismatch -Path $pathText
+    }
+    elseif ($status -in @('Extra File', 'Extra Dir', '*EXTRA File', '*EXTRA Dir')) {
+        Add-SummaryPath -Set $script:SummaryExtras -Path $pathText
     }
 
     return [PSCustomObject]@{
         Status = $status
         Path = $pathText
         SizeBytes = $sizeBytes
-        CountsAsProcessed = ($status -in @('New File', 'Newer', 'Older', 'Same', 'Tweaked', 'Skipped'))
+        CountsAsProcessed = ($status -in @('New File', 'Newer', 'Older', 'Same', 'Tweaked', 'Skipped', 'Mismatched', '*MISMATCH'))
         CountsAsCopied = ($status -in @('New File', 'Newer', 'Older', 'Tweaked'))
     }
 }
@@ -783,15 +978,27 @@ function Reset-CopyMetrics {
     $script:SourceTotalBytes = 0L
     $script:ProcessedBytes = 0L
     $script:CopiedBytes = 0L
+    $script:LastMetricsUpdate = $null
+    $script:LastCopiedBytesSample = 0L
+    $script:SmoothedMbps = 0.0
+    $script:SmoothedBpsForEta = 0.0
+    $script:LastEtaUpdate = $null
+    $script:SummarySkipped.Clear()
+    $script:SummaryMismatch.Clear()
+    $script:SummaryFailed.Clear()
+    $script:SummaryExtras.Clear()
+    $script:LastTimesRow = $null
     $script:statusElapsedLabel.Text = 'Elapsed: 00:00:00'
     $script:statusEtaLabel.Text = 'ETA: calculating...'
-    $script:statusThroughputLabel.Text = 'Throughput: 0.00 Mbps'
+    $script:statusThroughputLabel.Text = 'Throughput: 0.0 Mbps'
     $script:pbOverall.Style = 'Blocks'
     $script:pbOverall.Value = 0
     $script:lblProgressValue.Text = '0.0%'
 }
 
 function Update-CopyMetrics {
+    param([switch]$Force)
+
     if (-not $script:CopyStartTime) {
         Reset-CopyMetrics
         return
@@ -804,21 +1011,38 @@ function Update-CopyMetrics {
 
     $script:statusElapsedLabel.Text = 'Elapsed: {0}' -f (Format-DurationText -Duration $elapsed)
 
-    $mbps = 0.0
-    if ($script:CopiedBytes -gt 0) {
-        $mbps = ($script:CopiedBytes * 8.0) / 1000000.0 / $elapsed.TotalSeconds
+    $now = Get-Date
+    $shouldRefreshThroughput = $Force -or -not $script:LastMetricsUpdate -or (($now - $script:LastMetricsUpdate).TotalSeconds -ge 30)
+    if ($shouldRefreshThroughput) {
+        $windowSeconds = if ($script:LastMetricsUpdate) { [Math]::Max(1.0, ($now - $script:LastMetricsUpdate).TotalSeconds) } else { [Math]::Max(1.0, $elapsed.TotalSeconds) }
+        $deltaBytes = [Math]::Max(0.0, [double]($script:CopiedBytes - $script:LastCopiedBytesSample))
+        $bps = ($deltaBytes * 8.0) / $windowSeconds
+        if ($script:LastMetricsUpdate -eq $null) {
+            $script:SmoothedBpsForEta = $bps
+        }
+        else {
+            $script:SmoothedBpsForEta = (($script:SmoothedBpsForEta * 2.0) + $bps) / 3.0
+        }
+
+        $script:SmoothedMbps = $script:SmoothedBpsForEta / 1000000.0
+        $script:LastMetricsUpdate = $now
+        $script:LastCopiedBytesSample = $script:CopiedBytes
     }
-    $script:statusThroughputLabel.Text = 'Throughput: {0:N2} Mbps' -f $mbps
+    $script:statusThroughputLabel.Text = 'Throughput: {0:N1} Mbps' -f $script:SmoothedMbps
 
     if ($script:SourceTotalBytes -gt 0 -and $script:ProcessedBytes -gt 0) {
         $ratio = [Math]::Min(1.0, ($script:ProcessedBytes / [double]$script:SourceTotalBytes))
         $script:pbOverall.Style = 'Blocks'
         $script:pbOverall.Value = [Math]::Min($script:pbOverall.Maximum, [Math]::Max(0, [int]([Math]::Round($ratio * $script:pbOverall.Maximum))))
         $script:lblProgressValue.Text = '{0:N1}%' -f ($ratio * 100.0)
-        if ($ratio -gt 0) {
-            $remainingSeconds = [Math]::Max(0.0, ($elapsed.TotalSeconds / $ratio) - $elapsed.TotalSeconds)
-            $eta = (Get-Date).AddSeconds($remainingSeconds)
-            $script:statusEtaLabel.Text = 'ETA: {0}' -f $eta.ToString('HH:mm:ss')
+
+        $shouldRefreshEta = $Force -or -not $script:LastEtaUpdate -or (($now - $script:LastEtaUpdate).TotalSeconds -ge 60)
+        if ($script:SmoothedBpsForEta -gt 0 -and $shouldRefreshEta) {
+            $remainingBytes = [Math]::Max(0.0, [double]$script:SourceTotalBytes - [double]$script:ProcessedBytes)
+            $remainingSeconds = $remainingBytes * 8.0 / $script:SmoothedBpsForEta
+            $eta = $now.AddSeconds([Math]::Max(0.0, $remainingSeconds))
+            $script:statusEtaLabel.Text = 'ETA: {0}' -f $eta.ToString('hh:mm:ss tt')
+            $script:LastEtaUpdate = $now
             return
         }
     }
@@ -965,9 +1189,16 @@ function Refresh-JobButtons {
         $btnJob.Add_Click({
             param($s, $e)
             $j = $s.Tag
-            $script:tbSource.Text = $j.Source
-            $script:tbDest.Text = $j.Destination
-            Start-RoboCopyJob -Src $j.Source -Dst $j.Destination -Flags $j.Flags
+            Load-JobIntoEditor -Job $j
+            $ans = [System.Windows.Forms.MessageBox]::Show(
+                "Run saved job '$($j.Name)' now?",
+                'Run Saved Job',
+                [System.Windows.Forms.MessageBoxButtons]::YesNo,
+                [System.Windows.Forms.MessageBoxIcon]::Question
+            )
+            if ($ans -eq [System.Windows.Forms.DialogResult]::Yes) {
+                Start-RoboCopyJob -Src $j.Source -Dst $j.Destination -Flags $j.Flags
+            }
         })
 
         $ctx = New-Object System.Windows.Forms.ContextMenuStrip
@@ -1087,6 +1318,9 @@ function Start-RoboCopyJob {
     }
 
     Start-RunLog
+    $script:HasShownRuntimeErrorDialog = $false
+    Set-OutputLogCollapsed -Collapsed $false
+    $script:AutoCollapseAt = $null
     Reset-RawOutputTracking
 
     $script:CopyStartTime = Get-Date
@@ -1115,7 +1349,12 @@ function Start-RoboCopyJob {
     }
     Write-Log ('-' * 90) ([System.Drawing.Color]::FromArgb(55, 55, 70))
     Write-Log "robocopy $cmdArgs" ([System.Drawing.Color]::FromArgb(120, 180, 255))
-    Write-Log "Run log file: $($script:RunLogPath)" ([System.Drawing.Color]::FromArgb(120, 180, 255))
+    if ($script:RunLogWriter -and $script:RunLogPath) {
+        Write-Log "Run log file: $($script:RunLogPath)" ([System.Drawing.Color]::FromArgb(120, 180, 255))
+    }
+    else {
+        Write-Log 'Run log file could not be created. Check RoboVMCopy_Crash.log for details.' ([System.Drawing.Color]::FromArgb(255, 165, 0))
+    }
     Write-Log "Raw output capture: $($script:RawOutputPath)" ([System.Drawing.Color]::FromArgb(120, 180, 255))
 
     $script:OutputQueue = [System.Collections.Concurrent.ConcurrentQueue[string]]::new()
@@ -1138,6 +1377,8 @@ function Start-RoboCopyJob {
     $script:PollTimer.add_Tick({
         try {
             foreach ($line in @(Get-NewRawOutputLines)) {
+                Track-ResultLine -Line $line
+
                 $progressRecord = Get-RoboCopyProgressRecord -Line $line
                 if ($progressRecord) {
                     if ($progressRecord.CountsAsProcessed -and $progressRecord.SizeBytes -gt 0) {
@@ -1151,6 +1392,16 @@ function Start-RoboCopyJob {
                 $currentFile = Get-CurrentFileActivityFromLine -Line $line
                 if ($currentFile) {
                     Set-CurrentFileActivity -Text $currentFile -Color $clrText
+                }
+
+                $trimmedLine = $line.Trim()
+                if ($trimmedLine -match '^\d+%$') {
+                    $percentText = $trimmedLine.TrimEnd('%')
+                    $percentValue = 0
+                    if ([int]::TryParse($percentText, [ref]$percentValue)) {
+                        $script:lblProgressValue.Text = '{0}.0%' -f $percentValue
+                    }
+                    continue
                 }
 
                 $color = if ($line -match 'ERROR|error|STDERR:') {
@@ -1169,6 +1420,11 @@ function Start-RoboCopyJob {
             }
 
             Update-CopyMetrics
+
+            if ($script:AutoCollapseAt -and (Get-Date) -ge $script:AutoCollapseAt -and -not $script:LogIsCollapsed) {
+                Set-OutputLogCollapsed -Collapsed $true
+                $script:AutoCollapseAt = $null
+            }
 
             if ($script:RoboProcess.HasExited -and @(Get-NewRawOutputLines).Count -eq 0) {
                 $script:PollTimer.Stop()
@@ -1219,7 +1475,9 @@ function Start-RoboCopyJob {
                     if ($script:SourceTotalBytes -gt 0) {
                         $script:ProcessedBytes = [Math]::Max($script:ProcessedBytes, $script:SourceTotalBytes)
                     }
-                    Update-CopyMetrics
+                    Update-CopyMetrics -Force
+                    Write-DetailedSummary
+                    Queue-OutputLogAutoCollapse -Seconds 10
 
                     $script:btnRun.Enabled = $true
                     $script:btnStop.Enabled = $false
@@ -1228,17 +1486,28 @@ function Start-RoboCopyJob {
         }
         catch {
             Write-CrashLog ("Timer runtime error: {0}" -f $_.Exception.ToString())
+            if ($script:PollTimer) {
+                $script:PollTimer.Stop()
+            }
+            if ($script:RoboProcess -and -not $script:RoboProcess.HasExited) {
+                Stop-Process -Id $script:RoboProcess.Id -Force -ErrorAction SilentlyContinue
+            }
+            Close-RunLog
             $script:statusLabel.Text = 'Runtime error (see log)'
             $script:statusBar.BackColor = $clrRed
             $script:btnRun.Enabled = $true
             $script:btnStop.Enabled = $false
+            Set-CurrentFileActivity -Text 'Runtime error' -Color ([System.Drawing.Color]::FromArgb(255, 100, 100))
             Write-Log ("Runtime error: {0}" -f $_.Exception.Message) ([System.Drawing.Color]::FromArgb(255, 100, 100))
-            [System.Windows.Forms.MessageBox]::Show(
-                "A runtime error occurred while updating copy output:`r`n`r`n$($_.Exception.Message)",
-                'RoboVMCopy Error',
-                [System.Windows.Forms.MessageBoxButtons]::OK,
-                [System.Windows.Forms.MessageBoxIcon]::Error
-            ) | Out-Null
+            if (-not $script:HasShownRuntimeErrorDialog) {
+                $script:HasShownRuntimeErrorDialog = $true
+                [System.Windows.Forms.MessageBox]::Show(
+                    "A runtime error occurred while updating copy output:`r`n`r`n$($_.Exception.Message)",
+                    'RoboVMCopy Error',
+                    [System.Windows.Forms.MessageBoxButtons]::OK,
+                    [System.Windows.Forms.MessageBoxIcon]::Error
+                ) | Out-Null
+            }
         }
     })
 
@@ -1368,8 +1637,15 @@ $btnSaveJob.Add_Click({
     Write-Log "Saved job '$name' [$src -> $dst]" ([System.Drawing.Color]::FromArgb(120, 180, 255))
 })
 
-$btnClearLog.Add_Click({
+$script:btnClearLog.Add_Click({
     $script:rtLog.Clear()
+})
+
+$script:btnToggleLog.Add_Click({
+    Set-OutputLogCollapsed -Collapsed (-not $script:LogIsCollapsed)
+    if (-not $script:LogIsCollapsed) {
+        $script:AutoCollapseAt = $null
+    }
 })
 
 $script:form.Add_FormClosing({
@@ -1396,10 +1672,11 @@ Write-Log 'RoboVMCopy ready.' ([System.Drawing.Color]::FromArgb(120, 180, 255))
 Write-Log '1. Browse for source and destination folders.' $clrMuted
 Write-Log '2. Pick your RoboCopy options.' $clrMuted
 Write-Log '3. Click Run RoboCopy, or save as a quick-launch job button.' $clrMuted
-Write-Log '4. Left click a saved button to run it.' $clrMuted
+Write-Log '4. Left click a saved button to load it, then optionally run it now.' $clrMuted
 Write-Log '5. Right click a saved button for load/edit/run/delete options.' $clrMuted
-Write-Log '6. Every run is saved beside the script as RoboCopy_yyyyMMdd_HHmmss.log.' $clrMuted
+Write-Log '6. Every run is saved in the Logs folder as RoboCopy_yyyyMMdd_HHmmss.log.' $clrMuted
 Write-Log '7. Per-file RoboCopy output is always shown in the GUI.' $clrMuted
+Set-OutputLogCollapsed -Collapsed $false
 Set-CurrentFileActivity -Text 'Idle' -Color $clrText
 Reset-CopyMetrics
 Write-Log '' $clrMuted

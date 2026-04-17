@@ -11,10 +11,10 @@ RoboVMCopy lets you:
 - Show the current file activity in a dedicated live status area
 - Show a visual overall progress bar tied to the live copy metrics
 - Show elapsed time, estimated completion time, and throughput in the status bar
-- Save each run output to a timestamped log file beside the script
+- Save each run output to a timestamped log file in a Logs sub-folder beside the script
 - Save copy jobs as quick-launch buttons
 - Edit or delete saved jobs from the context menu
-- Re-run saved jobs with one click
+- Re-run saved jobs from left-click confirmation or context menu
 
 ## Files
 
@@ -69,7 +69,7 @@ The application stays open after a job finishes. It only closes when you click *
 
 Saved jobs appear in the **Saved Jobs** panel.
 
-- Left click saved button: runs the job immediately
+- Left click saved button: loads the job and prompts "Run job now?"
 - Right click saved button: load paths, edit, run, or delete job
 
 To edit a saved job:
@@ -83,7 +83,7 @@ Delete prompts for confirmation before removal.
 
 ## Run Logs
 
-- Every run writes output to `RoboCopy_yyyyMMdd_HHmmss.log` in the same folder as `RoboVMCopy.ps1`
+- Every run writes output to `Logs/RoboCopy_yyyyMMdd_HHmmss.log` under the same folder as `RoboVMCopy.ps1`
 - The full path is shown in the output log when a run starts and when it finishes
 
 ## Built-In Option Controls
