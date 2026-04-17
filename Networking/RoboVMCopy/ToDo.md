@@ -9,3 +9,23 @@
 - [x] an extra blank saved copy process button is created when I save one
 - [x] I want to file copying process in the gui for each file.. just like is seen in cli when runniong robocopy
 
+- Send logs to the 'Logs' sub-folder
+- Update throughput ever30 seconds
+	- the number is displayed in hundredths, 0.01, change to whole number to tenths.
+	For example, currently a value of 0.02 would show as 20.0
+- ETA keep changing so much it is useless. Is this in time of day? Should be in 12-hr format
+	- maybe it should only be displayed as an average over every minute.
+- Overall Progress bar is not working 
+- Remove the words "The app stays open until you click Exit."
+- the Saved Job name field is overlapping Save Job button
+- When a saved job is clicked, load job information
+	- The prompt and ask "Run job now?"
+- Make Output Log box a collapsible section. Default open for 10 seconds after run, then collapse.
+- In the output log box, instead of displaying percentages complete, just refresh the percentage number in place and not put it on a new line? Like it shows up in terminal.
+
+- In the summary at the end:
+	- print the filenames of any files Skipped, Mismatch, FAILED, Extras
+
+- Add hover-over tool tips explaining each Robocopy Option
+- Also in summary, what are the values in Times row? 
+
