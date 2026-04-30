@@ -110,6 +110,28 @@ function Resolve-ThemeMode {
 	return 'Light'
 }
 
+function Resolve-ShowSplash {
+	param(
+		[AllowNull()]
+		[object]$ShowSplash
+	)
+
+	if ($null -eq $ShowSplash) {
+		return $true
+	}
+
+	if ($ShowSplash -is [bool]) {
+		return [bool]$ShowSplash
+	}
+
+	$parsedShowSplash = $true
+	if ([bool]::TryParse([string]$ShowSplash, [ref]$parsedShowSplash)) {
+		return $parsedShowSplash
+	}
+
+	return $true
+}
+
 function Get-ThemePalette {
 	param(
 		[Parameter(Mandatory)]
@@ -176,6 +198,10 @@ function Set-ThemeOnControl {
 			$Control.ForeColor = $Palette.Text
 		}
 	}
+	elseif ($Control -is [System.Windows.Forms.CheckBox]) {
+		$Control.BackColor = [System.Drawing.Color]::Transparent
+		$Control.ForeColor = $Palette.Text
+	}
 
 	if ($Control.Controls -and $Control.Controls.Count -gt 0) {
 		foreach ($child in $Control.Controls) {
@@ -196,7 +222,10 @@ function Save-TaxOptions {
 		[string]$DefaultTaxName,
 
 		[AllowNull()]
-		[string]$ThemeMode
+		[string]$ThemeMode,
+
+		[AllowNull()]
+		[object]$ShowSplash
 	)
 
 	$directory = Split-Path -Path $ConfigPath -Parent
@@ -207,10 +236,12 @@ function Save-TaxOptions {
 	$normalized = @(Resolve-TaxOptions -TaxOptions $TaxOptions)
 	$resolvedDefaultTaxName = Resolve-DefaultTaxName -TaxOptions $normalized -DefaultTaxName $DefaultTaxName
 	$resolvedThemeMode = Resolve-ThemeMode -ThemeMode $ThemeMode
+	$resolvedShowSplash = Resolve-ShowSplash -ShowSplash $ShowSplash
 
 	[PSCustomObject]@{
 		DefaultTaxName = $resolvedDefaultTaxName
 		ThemeMode = $resolvedThemeMode
+		ShowSplash = $resolvedShowSplash
 		TaxOptions = $normalized
 	} |
 		ConvertTo-Json -Depth 4 |
@@ -227,11 +258,13 @@ function Import-TaxOptions {
 		$defaults = @(Resolve-TaxOptions -TaxOptions (Get-DefaultTaxOptions))
 		$defaultTaxName = Resolve-DefaultTaxName -TaxOptions $defaults -DefaultTaxName ''
 		$themeMode = Resolve-ThemeMode -ThemeMode 'Light'
-		Save-TaxOptions -ConfigPath $ConfigPath -TaxOptions $defaults -DefaultTaxName $defaultTaxName -ThemeMode $themeMode
+		$showSplash = Resolve-ShowSplash -ShowSplash $true
+		Save-TaxOptions -ConfigPath $ConfigPath -TaxOptions $defaults -DefaultTaxName $defaultTaxName -ThemeMode $themeMode -ShowSplash $showSplash
 		return [PSCustomObject]@{
 			TaxOptions = $defaults
 			DefaultTaxName = $defaultTaxName
 			ThemeMode = $themeMode
+			ShowSplash = $showSplash
 		}
 	}
 
@@ -241,11 +274,13 @@ function Import-TaxOptions {
 			$defaults = @(Resolve-TaxOptions -TaxOptions (Get-DefaultTaxOptions))
 			$defaultTaxName = Resolve-DefaultTaxName -TaxOptions $defaults -DefaultTaxName ''
 			$themeMode = Resolve-ThemeMode -ThemeMode 'Light'
-			Save-TaxOptions -ConfigPath $ConfigPath -TaxOptions $defaults -DefaultTaxName $defaultTaxName -ThemeMode $themeMode
+			$showSplash = Resolve-ShowSplash -ShowSplash $true
+			Save-TaxOptions -ConfigPath $ConfigPath -TaxOptions $defaults -DefaultTaxName $defaultTaxName -ThemeMode $themeMode -ShowSplash $showSplash
 			return [PSCustomObject]@{
 				TaxOptions = $defaults
 				DefaultTaxName = $defaultTaxName
 				ThemeMode = $themeMode
+				ShowSplash = $showSplash
 			}
 		}
 
@@ -254,6 +289,7 @@ function Import-TaxOptions {
 		$loadedOptions = @()
 		$loadedDefaultTaxName = ''
 		$loadedThemeMode = 'Light'
+		$loadedShowSplash = $true
 		if ($loaded.PSObject.Properties['TaxOptions']) {
 			$loadedOptions = @($loaded.TaxOptions)
 			if ($loaded.PSObject.Properties['DefaultTaxName']) {
@@ -261,6 +297,9 @@ function Import-TaxOptions {
 			}
 			if ($loaded.PSObject.Properties['ThemeMode']) {
 				$loadedThemeMode = [string]$loaded.ThemeMode
+			}
+			if ($loaded.PSObject.Properties['ShowSplash']) {
+				$loadedShowSplash = Resolve-ShowSplash -ShowSplash $loaded.ShowSplash
 			}
 		}
 		else {
@@ -271,23 +310,27 @@ function Import-TaxOptions {
 		$normalized = @(Resolve-TaxOptions -TaxOptions $loadedOptions)
 		$resolvedDefaultTaxName = Resolve-DefaultTaxName -TaxOptions $normalized -DefaultTaxName $loadedDefaultTaxName
 		$resolvedThemeMode = Resolve-ThemeMode -ThemeMode $loadedThemeMode
-		Save-TaxOptions -ConfigPath $ConfigPath -TaxOptions $normalized -DefaultTaxName $resolvedDefaultTaxName -ThemeMode $resolvedThemeMode
+		$resolvedShowSplash = Resolve-ShowSplash -ShowSplash $loadedShowSplash
+		Save-TaxOptions -ConfigPath $ConfigPath -TaxOptions $normalized -DefaultTaxName $resolvedDefaultTaxName -ThemeMode $resolvedThemeMode -ShowSplash $resolvedShowSplash
 
 		return [PSCustomObject]@{
 			TaxOptions = $normalized
 			DefaultTaxName = $resolvedDefaultTaxName
 			ThemeMode = $resolvedThemeMode
+			ShowSplash = $resolvedShowSplash
 		}
 	}
 	catch {
 		$defaults = @(Resolve-TaxOptions -TaxOptions (Get-DefaultTaxOptions))
 		$defaultTaxName = Resolve-DefaultTaxName -TaxOptions $defaults -DefaultTaxName ''
 		$themeMode = Resolve-ThemeMode -ThemeMode 'Light'
-		Save-TaxOptions -ConfigPath $ConfigPath -TaxOptions $defaults -DefaultTaxName $defaultTaxName -ThemeMode $themeMode
+		$showSplash = Resolve-ShowSplash -ShowSplash $true
+		Save-TaxOptions -ConfigPath $ConfigPath -TaxOptions $defaults -DefaultTaxName $defaultTaxName -ThemeMode $themeMode -ShowSplash $showSplash
 		return [PSCustomObject]@{
 			TaxOptions = $defaults
 			DefaultTaxName = $defaultTaxName
 			ThemeMode = $themeMode
+			ShowSplash = $showSplash
 		}
 	}
 }
@@ -417,6 +460,54 @@ function Restart-AppInstance {
 	}
 }
 
+function Show-AboutMessage {
+	[void][System.Windows.Forms.MessageBox]::Show(
+		'This application created at the behest of T.A.Smith',
+		'About',
+		[System.Windows.Forms.MessageBoxButtons]::OK,
+		[System.Windows.Forms.MessageBoxIcon]::Information
+	)
+}
+
+function Show-StartupSplash {
+	param(
+		[Parameter(Mandatory)]
+		[string]$ThemeMode
+	)
+
+	$palette = Get-ThemePalette -ThemeMode $ThemeMode
+
+	$splash = New-Object System.Windows.Forms.Form
+	$splash.StartPosition = 'CenterScreen'
+	$splash.FormBorderStyle = 'None'
+	$splash.ShowInTaskbar = $false
+	$splash.TopMost = $true
+	$splash.Size = New-Object System.Drawing.Size(520, 160)
+	$splash.BackColor = $palette.FormBack
+
+	$label = New-Object System.Windows.Forms.Label
+	$label.AutoSize = $false
+	$label.Dock = [System.Windows.Forms.DockStyle]::Fill
+	$label.TextAlign = [System.Drawing.ContentAlignment]::MiddleCenter
+	$label.Font = New-Object System.Drawing.Font('Segoe UI Semibold', 12)
+	$label.ForeColor = $palette.Text
+	$label.Text = 'This application created at the behest of T.A.Smith'
+
+	$splash.Controls.Add($label)
+
+	$timer = New-Object System.Windows.Forms.Timer
+	$timer.Interval = 2000
+	$timer.Add_Tick({
+		$timer.Stop()
+		$splash.Close()
+	})
+
+	$timer.Start()
+	[void]$splash.ShowDialog()
+	$timer.Dispose()
+	$splash.Dispose()
+}
+
 function Show-TaxOptionsDialog {
 	param(
 		[Parameter(Mandatory)]
@@ -432,7 +523,10 @@ function Show-TaxOptionsDialog {
 		[string]$CurrentDefaultTaxName,
 
 		[AllowNull()]
-		[string]$CurrentThemeMode
+		[string]$CurrentThemeMode,
+
+		[AllowNull()]
+		[object]$CurrentShowSplash
 	)
 
 	$workingOptions = New-Object System.Collections.Generic.List[object]
@@ -441,6 +535,7 @@ function Show-TaxOptionsDialog {
 	}
 	$defaultTaxName = Resolve-DefaultTaxName -TaxOptions $workingOptions.ToArray() -DefaultTaxName $CurrentDefaultTaxName
 	$themeMode = Resolve-ThemeMode -ThemeMode $CurrentThemeMode
+	$showSplash = Resolve-ShowSplash -ShowSplash $CurrentShowSplash
 	$initialThemeMode = $themeMode
 
 	$dialog = New-Object System.Windows.Forms.Form
@@ -449,7 +544,7 @@ function Show-TaxOptionsDialog {
 	$dialog.FormBorderStyle = 'FixedDialog'
 	$dialog.MaximizeBox = $false
 	$dialog.MinimizeBox = $false
-	$dialog.ClientSize = New-Object System.Drawing.Size(500, 520)
+	$dialog.ClientSize = New-Object System.Drawing.Size(500, 560)
 
 	$listBox = New-Object System.Windows.Forms.ListBox
 	$listBox.Location = New-Object System.Drawing.Point(16, 16)
@@ -506,15 +601,21 @@ function Show-TaxOptionsDialog {
 	[void]$comboTheme.Items.Add('Dark')
 	$comboTheme.SelectedItem = $themeMode
 
+	$checkShowSplash = New-Object System.Windows.Forms.CheckBox
+	$checkShowSplash.Text = 'Show splash message at startup'
+	$checkShowSplash.Location = New-Object System.Drawing.Point(16, 425)
+	$checkShowSplash.Size = New-Object System.Drawing.Size(280, 24)
+	$checkShowSplash.Checked = $showSplash
+
 	$statusLabel = New-Object System.Windows.Forms.Label
 	$statusLabel.Name = 'statusOptions'
-	$statusLabel.Location = New-Object System.Drawing.Point(16, 426)
+	$statusLabel.Location = New-Object System.Drawing.Point(16, 460)
 	$statusLabel.Size = New-Object System.Drawing.Size(468, 22)
 	$statusLabel.ForeColor = [System.Drawing.Color]::Firebrick
 
 	$buttonDone = New-Object System.Windows.Forms.Button
 	$buttonDone.Text = 'Done'
-	$buttonDone.Location = New-Object System.Drawing.Point(354, 458)
+	$buttonDone.Location = New-Object System.Drawing.Point(354, 494)
 	$buttonDone.Size = New-Object System.Drawing.Size(130, 32)
 
 	$dialogState = [PSCustomObject]@{ DidChange = $false; AnyChange = $false; RestartRequested = $false }
@@ -626,7 +727,7 @@ function Show-TaxOptionsDialog {
 			try {
 				$finalOptions = @(Resolve-TaxOptions -TaxOptions $workingOptions.ToArray())
 				$resolvedDefaultTaxName = Resolve-DefaultTaxName -TaxOptions $finalOptions -DefaultTaxName $defaultTaxName
-				Save-TaxOptions -ConfigPath $ConfigPath -TaxOptions $finalOptions -DefaultTaxName $resolvedDefaultTaxName -ThemeMode $themeMode
+				Save-TaxOptions -ConfigPath $ConfigPath -TaxOptions $finalOptions -DefaultTaxName $resolvedDefaultTaxName -ThemeMode $themeMode -ShowSplash $showSplash
 				$defaultTaxName = $resolvedDefaultTaxName
 				$dialogState.DidChange = $false
 				$dialogState.AnyChange = $true
@@ -651,7 +752,7 @@ function Show-TaxOptionsDialog {
 				$finalOptions = @(Resolve-TaxOptions -TaxOptions $workingOptions.ToArray())
 				$resolvedDefaultTaxName = Resolve-DefaultTaxName -TaxOptions $finalOptions -DefaultTaxName $defaultTaxName
 				$resolvedThemeMode = Resolve-ThemeMode -ThemeMode $themeMode
-				Save-TaxOptions -ConfigPath $ConfigPath -TaxOptions $finalOptions -DefaultTaxName $resolvedDefaultTaxName -ThemeMode $resolvedThemeMode
+				Save-TaxOptions -ConfigPath $ConfigPath -TaxOptions $finalOptions -DefaultTaxName $resolvedDefaultTaxName -ThemeMode $resolvedThemeMode -ShowSplash $showSplash
 				$defaultTaxName = $resolvedDefaultTaxName
 				$themeMode = $resolvedThemeMode
 				$dialogState.DidChange = $false
@@ -684,6 +785,14 @@ function Show-TaxOptionsDialog {
 			}
 		})
 
+	$checkShowSplash.Add_CheckedChanged({
+			$showSplash = $checkShowSplash.Checked
+			$dialogState.DidChange = $true
+			$dialogState.AnyChange = $true
+			$statusLabel.ForeColor = [System.Drawing.Color]::ForestGreen
+			$statusLabel.Text = 'Splash startup preference updated. Save with Done (or close Options).'
+		})
+
 	$saveChanges = {
 		if (-not $dialogState.DidChange) {
 			return
@@ -691,7 +800,7 @@ function Show-TaxOptionsDialog {
 
 		$finalOptions = @(Resolve-TaxOptions -TaxOptions $workingOptions.ToArray())
 		$resolvedDefaultTaxName = Resolve-DefaultTaxName -TaxOptions $finalOptions -DefaultTaxName $defaultTaxName
-		Save-TaxOptions -ConfigPath $ConfigPath -TaxOptions $finalOptions -DefaultTaxName $resolvedDefaultTaxName -ThemeMode $themeMode
+		Save-TaxOptions -ConfigPath $ConfigPath -TaxOptions $finalOptions -DefaultTaxName $resolvedDefaultTaxName -ThemeMode $themeMode -ShowSplash $showSplash
 		$defaultTaxName = $resolvedDefaultTaxName
 		$dialogState.DidChange = $false
 	}
@@ -718,6 +827,7 @@ function Show-TaxOptionsDialog {
 			$labelDefault,
 			$labelTheme,
 			$comboTheme,
+			$checkShowSplash,
 			$statusLabel,
 			$buttonDone
 		))
@@ -734,6 +844,7 @@ function Show-TaxOptionsDialog {
 		Options = @(Resolve-TaxOptions -TaxOptions $workingOptions.ToArray())
 		DefaultTaxName = $defaultTaxName
 		ThemeMode = $themeMode
+		ShowSplash = $showSplash
 		ThemeChanged = ($themeMode -ne $initialThemeMode)
 		RestartRequested = $dialogState.RestartRequested
 	}
@@ -758,12 +869,17 @@ $taxConfig = Import-TaxOptions -ConfigPath $configPath
 $taxOptions = @($taxConfig.TaxOptions)
 $defaultTaxName = [string]$taxConfig.DefaultTaxName
 $themeMode = Resolve-ThemeMode -ThemeMode ([string]$taxConfig.ThemeMode)
+$showSplash = Resolve-ShowSplash -ShowSplash $taxConfig.ShowSplash
 
 $form = New-Object System.Windows.Forms.Form
 $form.Text = 'BidFTA Auction Total Calculator'
 $form.StartPosition = 'CenterScreen'
 $form.Size = New-Object System.Drawing.Size(700, 470)
 $form.MinimumSize = New-Object System.Drawing.Size(700, 470)
+$form.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::FixedDialog
+$form.MaximizeBox = $false
+$form.MinimizeBox = $false
+$form.HelpButton = $true
 
 $fontLabel = New-Object System.Drawing.Font('Segoe UI', 10)
 $fontValue = New-Object System.Drawing.Font('Segoe UI Semibold', 10)
@@ -930,12 +1046,19 @@ $updateTotals = {
 $textBid.Add_TextChanged({ & $updateTotals })
 $comboTax.Add_SelectedIndexChanged({ & $updateTotals })
 
+$form.Add_HelpButtonClicked({
+		param($helpSender, $helpEventArgs)
+		Show-AboutMessage
+		$helpEventArgs.Cancel = $true
+	})
+
 $buttonOptions.Add_Click({
-		$result = Show-TaxOptionsDialog -Owner $form -ConfigPath $configPath -TaxOptions $currentTaxOptions -CurrentDefaultTaxName $defaultTaxName -CurrentThemeMode $themeMode
+		$result = Show-TaxOptionsDialog -Owner $form -ConfigPath $configPath -TaxOptions $currentTaxOptions -CurrentDefaultTaxName $defaultTaxName -CurrentThemeMode $themeMode -CurrentShowSplash $showSplash
 
 		$currentTaxOptions = @(Resolve-TaxOptions -TaxOptions $result.Options)
 		$defaultTaxName = Resolve-DefaultTaxName -TaxOptions $currentTaxOptions -DefaultTaxName ([string]$result.DefaultTaxName)
 		$themeMode = Resolve-ThemeMode -ThemeMode ([string]$result.ThemeMode)
+		$showSplash = Resolve-ShowSplash -ShowSplash $result.ShowSplash
 		$selectedIndex = Get-TaxOptionIndex -TaxOptions $currentTaxOptions -TaxName $defaultTaxName
 		& $refreshTaxDropdown -PreferredIndex $selectedIndex
 
@@ -978,5 +1101,9 @@ $launchIndex = Get-TaxOptionIndex -TaxOptions $currentTaxOptions -TaxName $defau
 $palette = Get-ThemePalette -ThemeMode $themeMode
 Set-ThemeOnControl -Control $form -Palette $palette -PreserveStatusColor
 & $updateTotals
+
+if ($showSplash) {
+	Show-StartupSplash -ThemeMode $themeMode
+}
 
 [void]$form.ShowDialog()

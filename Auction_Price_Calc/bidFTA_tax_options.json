@@ -1,6 +1,6 @@
 ﻿{
     "DefaultTaxName":  "OH Clermont (6.75%)",
-    "ThemeMode":  "Light",
+    "ThemeMode":  "Dark",
     "TaxOptions":  [
                        {
                            "Name":  "OH Clermont (6.75%)",
