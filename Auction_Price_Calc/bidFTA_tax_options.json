@@ -1,15 +1,15 @@
-{
-  "DefaultTaxName": "OH Clermont (6.75%)",
-  "ThemeMode": "Dark",
-  "ShowSplash": true,
-  "TaxOptions": [
-    {
-      "Name": "OH Clermont (6.75%)",
-      "Rate": 6.75
-    },
-    {
-      "Name": "OH Hamilton (7.8%)",
-      "Rate": 7.8
-    }
-  ]
+﻿{
+    "DefaultTaxName":  "OH Clermont (6.75%)",
+    "ThemeMode":  "Dark",
+    "ShowSplash":  true,
+    "TaxOptions":  [
+                       {
+                           "Name":  "OH Clermont (6.75%)",
+                           "Rate":  6.75
+                       },
+                       {
+                           "Name":  "OH Hamilton (7.8%)",
+                           "Rate":  7.8
+                       }
+                   ]
 }
